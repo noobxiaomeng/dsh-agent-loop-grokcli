@@ -1,0 +1,16 @@
+# GrokDesk 桥的 profile 层 patch（dsh plugin add 自动挂载）。
+# 与 cordis.patch.yml 手工层同格式：先顶替引擎槽位（agent-loop 禁用），再挂桥。
+#
+# 路径零配置：grokBin/realHome/cwd 省略时自动探测——grokBin 取 GrokCLI 官方安装位
+# （Windows: %USERPROFILE%\.grok\bin\grok.exe，macOS/Linux: ~/.grok/bin/grok）。
+# 自定义路径（如隔离的 alpha 副本）在你的 profile 手工 patch 层加 override：
+#   - id: grokcli-bridge
+#     config:
+#       grokBin: 'D:/tools/grok-alpha/grok.exe'
+- id: agent-loop
+  disabled: true
+- insert:
+    - id: grokcli-bridge
+      name: 'dsh-agent-loop-grokcli'
+      config:
+        defaultModel: 'grok-4.7'

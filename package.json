@@ -1,0 +1,31 @@
+{
+  "name": "dsh-agent-loop-grokcli",
+  "version": "0.1.0",
+  "description": "GrokCLI (xAI grok-build) as the dsh engine via the agents factory seam · GrokDesk by noobxiaomeng",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "dsh-patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    }
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

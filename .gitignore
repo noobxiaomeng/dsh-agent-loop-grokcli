@@ -1,0 +1,7 @@
+node_modules/
+# 运行时状态（真实位置在 ~/.grokdesk/，源目录残留不进 git）
+grok-session-map.json
+# 本机调试装配与冒烟（含本机路径）
+overlay.yml
+overlay-src.yml
+smoke-lib.mjs
