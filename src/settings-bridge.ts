@@ -72,7 +72,14 @@ export async function decorateEfforts(ctx: Context, entries: GrokProfileEntry[])
         }
       }
     } catch { /* 目录拉不到就跳过装饰 */ }
-    if (!effortsByModel || effortsByModel.size === 0) continue;
+    // 兜底（2026-10-06）：目录拉不到/为空（中转欠费 403、网络抖动）时，对 grok 系模型用
+    // 已知词表硬编码装饰——否则 UI 保存设置会重写 providers 段（装饰字段丢失），而欠费期
+    // 的重新装饰补不回来 → 模型选择器只剩模型名、档位菜单消失（实测踩坑）。
+    if (!effortsByModel || effortsByModel.size === 0) {
+      if (!/^grok/i.test(e.baseUrl)) continue;
+      effortsByModel = new Map(e.models.map(m => [m, ["low", "medium", "high", "xhigh"]]));
+      console.log(`[grokcli] effort 装饰走硬编码兜底（中转目录不可达）：${e.models.join(",")}`);
+    }
 
     // 2) 差分写回（仅补缺失/不同的 reasoningEfforts，绝不动清单成员与其他字段）
     let changed = false;

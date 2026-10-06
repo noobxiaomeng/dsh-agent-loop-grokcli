@@ -40,33 +40,47 @@ function configTomlPath(realHome: string) {
  * - baseUrlOverride：写入档案 base_url 的覆盖值（单模型钉死转发器的本地地址），
  *   真实上游由转发器内部持有。
  */
-export function syncGrokProfiles(realHome: string, entries: GrokProfileEntry[], modelOverride?: string | null, baseUrlOverride?: string): void {
-  if (!entries.length) return;
+/**
+ * 把档案清单全量重写进 config.toml 的 [model.grokdesk-*] 段。
+ * @returns 档案内容是否发生变化（key/base_url 等）——变化时调用方应重建 grok 连接：
+ *   grok 进程只在 spawn 时读一次 config.toml，旧进程内存里永远是旧 key（实测踩坑：
+ *   换 key 后 config 已更新但复用的 grok 进程仍用旧 key 请求 → 403「换了没用」）。
+ */
+export function syncGrokProfiles(realHome: string, entries: GrokProfileEntry[], modelOverride?: string | null, baseUrlOverride?: string): boolean {
+  if (!entries.length) return false;
   const path = configTomlPath(realHome);
   try {
     const raw = existsSync(path) ? readFileSync(path, "utf-8") : "";
     const lines = raw.split("\n");
     const kept: string[] = [];
+    const oldManaged: string[] = [];
     let inManaged = false;
     for (const line of lines) {
       const h = line.match(/^\s*\[([^\]]+)\]\s*$/);
       if (h) inManaged = /^model\.grokdesk-/.test(h[1]);
       if (!inManaged) kept.push(line);
+      else oldManaged.push(line.trim());
     }
     let out = kept.join("\n").replace(/\n{3,}$/, "\n");
+    const newManaged: string[] = [];
     for (const e of entries) {
-      out += `\n[model.grokdesk-${e.id}]\n`;
-      out += `api_backend = ${JSON.stringify(e.backend)}\n`;
-      out += `api_key = ${JSON.stringify(e.apiKey)}\n`;
-      out += `base_url = ${JSON.stringify(baseUrlOverride || e.baseUrl)}\n`;
+      const section = `\n[model.grokdesk-${e.id}]\n`;
       const profModel = modelOverride || (e.models.length ? e.models[0] : null);
-      if (profModel) out += `model = ${JSON.stringify(profModel)}\n`;
-      out += `name = ${JSON.stringify(String(e.name))}\n`;
+      const body = `api_backend = ${JSON.stringify(e.backend)}\n`
+        + `api_key = ${JSON.stringify(e.apiKey)}\n`
+        + `base_url = ${JSON.stringify(baseUrlOverride || e.baseUrl)}\n`
+        + (profModel ? `model = ${JSON.stringify(profModel)}\n` : "")
+        + `name = ${JSON.stringify(String(e.name))}\n`;
+      out += section + body;
+      newManaged.push(section.trim(), ...body.split("\n").filter(Boolean));
     }
-    writeFileSync(path, out, "utf-8");
+    const changed = oldManaged.join("\n") !== newManaged.join("\n");
+    if (changed) writeFileSync(path, out, "utf-8");
+    return changed;
   } catch (e) {
     // 同步失败不致命：grok 还能用手写档案/默认档案跑
     console.warn("[grokcli] config.toml sync failed:", e);
+    return false;
   }
 }
 

@@ -414,7 +414,14 @@ export class GrokBridgeAgent implements Agent {
     if (ownerEntry && ownerEntry.baseUrl && ownerEntry.apiKey && route.model) {
       baseOverride = (await this.modelSource.pinTarget(route.model, ownerEntry.baseUrl, this.explicitEffort())) ?? undefined;
     }
-    if (entries.length > 0) syncGrokProfiles(this.config.realHome, entries, route.model, baseOverride);
+    if (entries.length > 0 && syncGrokProfiles(this.config.realHome, entries, route.model, baseOverride) && this.boundSpawnKey) {
+      // 档案变化（换 key/换中转地址）：grok 进程只在 spawn 时读一次 config.toml，旧进程
+      // 内存里永远是旧 key（实测踩坑：换 key 后仍 403「换了没用」）。断开连接池强制下段
+      // 重建——新 spawn 读新档案；grok 会话在磁盘，loadSession 跨进程恢复上下文不丢。
+      console.log("[grokcli] grokdesk 档案变化 -> 重建 grok 连接（新进程读新配置）");
+      this.driver.dispose();
+      this.boundSpawnKey = ""; // 骗过下方复用判断：走 makeDriver + spawn 新进程
+    }
     this.session.append("request/header", {
       header: { config: { provider: PROVIDER, model: route.model || route.spawnKey || "grok", ...this.explicitEffort() ? { reasoningEffort: this.explicitEffort() as never } : {} } },
       reason: this.acpSessionId === null ? "initial" : "series",

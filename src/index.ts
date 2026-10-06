@@ -96,6 +96,30 @@ export function apply(ctx: Context, config: BridgeConfig) {
     if (ns === "llm-pi-ai") void factory.refreshProfiles();
   }) as never);
 
+  // ── 前端「永久删除」执行端点（2026-10-06）：dsh 原生只有归档没有删除；侧栏菜单项
+  // （client 模块注册）POST 到这里。编排 = archive（归档集推送 → 前端列表即时隐藏）
+  // → 物理删（磁盘目录 + projcache）→ unarchive 清归档集（触发 workspace 候选账目
+  // prune，残项自动剪除）——三层都走官方事件/账目链，前端无需额外刷新逻辑。
+  ctx.inject(["webServer"], (webCtx: Context) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: "exact",
+      path: "/grokdesk/delete-session",
+      handler: async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += String(chunk);
+        let sessionId = "";
+        try { sessionId = String((JSON.parse(body) || {}).sessionId ?? ""); } catch { /* bad json */ }
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        if (!/^session-[0-9a-f-]{30,}$/i.test(sessionId)) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ ok: false, error: "bad sessionId" }));
+          return;
+        }
+        res.end(JSON.stringify(await deleteSessionCompletely(ctx, sessionId)));
+      },
+    }), "grokcli.delete-session route");
+  });
+
   // ── 斜杠命令（2026-10-06 ·「更像 zcode」第二批；commands 服务 = 插件级人命令注册表，
   // handler 不进模型上下文）。Cordis 铁律：服务获取整体 try/catch，取不到静默降级。
   const commandsSvc = (() => {
@@ -164,6 +188,7 @@ export function apply(ctx: Context, config: BridgeConfig) {
             }
           } catch { /* readdir 失败跳过 */ }
           try { rmSync(`${projcacheDir}/${uuid}.json`, { force: true }); } catch { /* projcache 条目可缺 */ }
+          try { rmSync(`${projcacheDir}/${id}.json`, { force: true }); } catch { /* 两种文件名形态都清 */ }
           try { await registry?.unarchiveSession(id); } catch (e) { console.log(`[grokcli] grokclean unarchive ${id.slice(0, 14)} failed: ${String(e).slice(0, 140)}`); }
           deleted.push(`${id.slice(0, 18)}${removedDir ? "" : "（目录已不在，仅清注册表）"}`);
         }
@@ -172,4 +197,36 @@ export function apply(ctx: Context, config: BridgeConfig) {
     } as never), "grokcli.commands.grokclean()");
     console.log("[grokcli-bridge] command registered: /grokstatus, /grokclean");
   }
+}
+
+/** 单会话彻底删除（archive → 磁盘 + projcache → unarchive 清归档集），前端删除按钮的执行体。 */
+async function deleteSessionCompletely(ctx: Context, sessionId: string): Promise<{ ok: boolean; removedDir: boolean; notes: string[] }> {
+  const sessionsRoot = join(homedir(), ".dsh", "sessions");
+  const projcacheDir = join(homedir(), ".dsh", "storages", "session_projcache", "sessions");
+  let registry: {
+    archiveSession?(id: string, o?: Record<string, unknown>): Promise<void>;
+    unarchiveSession?(id: string): Promise<void>;
+  } | undefined;
+  try { registry = (ctx as unknown as { get(n: string): unknown }).get("workspaceRegistry") as typeof registry; } catch { registry = undefined; }
+  const notes: string[] = [];
+  try { await registry?.archiveSession?.(sessionId); } catch (e) { notes.push(`archive: ${String(e).slice(0, 90)}`); }
+  let removedDir = false;
+  try {
+    for (const ws of readdirSync(sessionsRoot)) {
+      const dir = join(sessionsRoot, ws, sessionId);
+      if (existsSync(dir)) { rmSync(dir, { recursive: true, force: true }); removedDir = true; }
+    }
+  } catch { /* readdir 失败跳过 */ }
+  // projcache 文件名两种形态都清（实测见 session- 前缀形态；uuid 形态留兼容）
+  for (const fn of [`${sessionId}.json`, `${sessionId.replace(/^session-/, "")}.json`]) {
+    try { rmSync(join(projcacheDir, fn), { force: true }); } catch { /* 条目可缺 */ }
+  }
+  // unarchive 延迟一拍：archive 的归档集推送先让前端把行过滤掉（archivedSet 是响应式），
+  // 立刻 unarchive 会让前端只见到最终态（归档集外+成员账目残项）——幽灵行当场复活
+  // （实测踩坑）。8s 后清归档集，残项由后续 workspace mutation prune。
+  setTimeout(() => {
+    void registry?.unarchiveSession?.(sessionId).catch(() => {});
+  }, 8_000);
+  console.log(`[grokcli] session deleted: ${sessionId.slice(0, 18)} dir=${removedDir}${notes.length ? ` notes=${notes.join("; ")}` : ""}`);
+  return { ok: true, removedDir, notes };
 }
