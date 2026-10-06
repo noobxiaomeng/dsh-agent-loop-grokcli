@@ -65,7 +65,15 @@ interface OpenAiUsage { prompt_tokens?: number; completion_tokens?: number; tota
 const usageLog: Array<{ ts: number; usage: OpenAiUsage }> = [];
 function recordUsage(u: unknown): void {
   if (!u || typeof u !== "object") return;
-  const o = u as OpenAiUsage;
+  const o = u as OpenAiUsage & { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
+  // responses 协议形状（input_tokens/output_tokens）归一成 chat 形状再入库
+  if (o.prompt_tokens === undefined && o.completion_tokens === undefined
+    && (o.input_tokens !== undefined || o.output_tokens !== undefined)) {
+    (o as Record<string, unknown>).prompt_tokens = o.input_tokens;
+    (o as Record<string, unknown>).completion_tokens = o.output_tokens;
+    (o as Record<string, unknown>).total_tokens = o.total_tokens ?? (o.input_tokens ?? 0) + (o.output_tokens ?? 0);
+    (o as Record<string, unknown>).prompt_tokens_details = { cached_tokens: o.input_tokens_details?.cached_tokens ?? 0 };
+  }
   if (o.prompt_tokens === undefined && o.completion_tokens === undefined) return;
   usageLog.push({
     ts: Date.now(),
@@ -178,9 +186,11 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       // 丢弃/形状补全（那会把正常 responses 事件全扔掉）。
       const passthroughResponses = typeof req.url === "string" && req.url.includes("/responses");
       if (passthroughResponses) {
+        let whole = "";
         let acc2 = "";
         upRes.on("data", (d: Buffer) => {
           res.write(d);
+          whole += d.toString("utf8");
           acc2 += d.toString("utf8");
           let i2: number;
           while ((i2 = acc2.indexOf("\n")) >= 0) {
@@ -192,7 +202,11 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
             try { recordUsage((JSON.parse(p2) as { response?: { usage?: unknown }; usage?: unknown }).response?.usage); } catch { /* 忽略 */ }
           }
         });
-        upRes.on("end", () => res.end());
+        upRes.on("end", () => {
+          // 非流式 responses 响应是整块 JSON：顶层 usage（input_tokens/output_tokens 形状）
+          try { recordUsage((JSON.parse(whole) as { usage?: unknown }).usage); } catch { /* 非 JSON 忽略 */ }
+          res.end();
+        });
         upRes.on("error", () => res.end());
         return;
       }
