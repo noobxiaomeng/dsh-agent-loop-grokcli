@@ -196,27 +196,32 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       // 丢弃/形状补全（那会把正常 responses 事件全扔掉）。
       const passthroughResponses = typeof req.url === "string" && req.url.includes("/responses");
       if (passthroughResponses) {
-        let whole = "";
-        let acc2 = "";
+        // 行级校验转发（2026-10-06）：中转大负载下会夹带含裸控制字符的坏 data 行（grok
+        // 严格解析炸 serialization error）——逐行 JSON 校验，坏行丢弃，好行原样转发；usage
+        // 从 response.completed 事件采集。
+        let buf = "";
         upRes.on("data", (d: Buffer) => {
-          res.write(d);
-          whole += d.toString("utf8");
-          acc2 += d.toString("utf8");
-          let i2: number;
-          while ((i2 = acc2.indexOf("\n")) >= 0) {
-            const l2 = acc2.slice(0, i2).trim();
-            acc2 = acc2.slice(i2 + 1);
-            if (!l2.startsWith("data:")) continue;
-            const p2 = l2.slice(5).trim();
-            if (!p2 || p2 === "[DONE]") continue;
-            try { recordUsage((JSON.parse(p2) as { response?: { usage?: unknown }; usage?: unknown }).response?.usage); } catch { /* 忽略 */ }
+          buf += d.toString("utf8");
+          let idx: number;
+          const out: string[] = [];
+          while ((idx = buf.indexOf("\n")) >= 0) {
+            const rawLine = buf.slice(0, idx);
+            buf = buf.slice(idx + 1);
+            const line = rawLine.trim();
+            if (!line.startsWith("data:")) { out.push(rawLine + "\n"); continue; }
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") { out.push(rawLine + "\n"); continue; }
+            try {
+              const ev = JSON.parse(payload) as { response?: { usage?: unknown }; usage?: unknown };
+              if (ev.response?.usage) recordUsage(ev.response.usage);
+              out.push(rawLine + "\n");
+            } catch {
+              console.log(`[grokcli] pin: 丢弃坏 data 行 responses (${payload.length}B)`);
+            }
           }
+          if (out.length > 0) res.write(out.join(""));
         });
-        upRes.on("end", () => {
-          // 非流式 responses 响应是整块 JSON：顶层 usage（input_tokens/output_tokens 形状）
-          try { recordUsage((JSON.parse(whole) as { usage?: unknown }).usage); } catch { /* 非 JSON 忽略 */ }
-          res.end();
-        });
+        upRes.on("end", () => { if (buf.trim()) res.write(buf); res.end(); });
         upRes.on("error", () => res.end());
         return;
       }
@@ -261,7 +266,13 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
               if (delta && typeof delta === "object" && typeof (delta.reasoning_content ?? delta.reasoning) === "string") {
                 rewritten = "data: " + JSON.stringify(ev) + "\n";
               }
-            } catch { /* 半包/非 JSON 忽略 */ }
+            } catch {
+              // 坏行防御（2026-10-06 实测踩坑：中转大负载下会夹带含裸控制字符  -
+              // 的 data 行，grok 严格 JSON 解析直接炸整回合 serialization error）——解析失败
+              // 的 data 行一律丢弃不透传（SSE 的 data 行按协议必须全是合法 JSON，丢的是坏行）。
+              console.log(`[grokcli] pin: 丢弃坏 data 行 (${payload.length}B)`);
+              continue;
+            }
             out.push(rewritten);
           }
           if (out.length > 0) res.write(out.join(""));
