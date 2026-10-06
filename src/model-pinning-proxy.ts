@@ -139,6 +139,16 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
           }
           // usage 采集（2026-10-05）：OpenAI 兼容体只在显式要求时才在流式终包带 usage；
           // 非流式响应默认带，无需注入。若上游拒认此参数会 4xx——冒烟/回归即暴露。
+          // responses 请求体补 reasoning.effort（2026-10-06）：grok 的 responses 客户端只发
+          // reasoning.summary（实测），spawn 旗标的档位不上请求体——服务端见不到等级。转发器
+          // 保底注入（已有 effort 时不碰；summary 等既有字段保留）。
+          if (isResponsesApi && target.effort) {
+            const r = parsed.reasoning as { effort?: string } | undefined;
+            if ((r === undefined || r.effort === undefined) && parsed.reasoning_effort === undefined) {
+              parsed.reasoning = { ...(r ?? {}), effort: target.effort };
+              notes.push(`reasoning.effort=${target.effort} injected`);
+            }
+          }
           // stream_options 是 chat 协议参数——responses API 不认（实测 500），只对 chat 注入
           if (!isResponsesApi && parsed.stream === true && parsed.stream_options?.include_usage !== true) {
             parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };

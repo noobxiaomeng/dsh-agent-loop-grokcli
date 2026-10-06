@@ -237,7 +237,10 @@ async function deleteSessionCompletely(ctx: Context, sessionId: string): Promise
       }
     }
   } catch (e) { notes.push(`detach: ${String(e).slice(0, 90)}`); }
-  try { await registry?.unarchiveSession?.(sessionId); } catch { /* 归档集里没有该 id 时会拒，无妨 */ }
+  // 注意：不再 unarchive——归档集条目保留是刻意的。store 里的内存活实例（页面曾打开过
+  // 该会话）会以「未分组」行复活（detach 后无账目可依，实测踩坑 2026-10-06 两轮）；归档
+  // 集条目让前端把一切归档会话从普通/未分组视图过滤掉，是唯一可靠的显示挡板。幽灵条目
+  // 由 /grokclean archived（账目已 detach，unarchive 不再复活）或 dsh 重启自愈清理。
   console.log(`[grokcli] session deleted: ${sessionId.slice(0, 18)} dir=${removedDir}${notes.length ? ` notes=${notes.join("; ")}` : ""}`);
   return { ok: true, removedDir, notes };
 }

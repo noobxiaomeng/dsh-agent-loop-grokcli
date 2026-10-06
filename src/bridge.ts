@@ -236,11 +236,27 @@ export class GrokBridgeAgent implements Agent {
    * 如 grok-4.6 原生默认 high vs overlay low → 「思考等级不一致」）。
    */
   private explicitEffort(): string | undefined {
+    const persisted = this.persistedSelection();
     const e = (this.nextEffort
       ?? this.options.reasoningEffort
-      ?? this.persistedSelection()?.reasoningEffort) as string | undefined;
+      ?? persisted?.reasoningEffort) as string | undefined;
+    // 第四来源（2026-10-06）：dsh 在「无会话时选档」会把选择写成 agent-default-model 的
+    // 全局默认（reasoningEffort）——但 controller 建 agent 不传档位，这个用户意图原本悬空
+    // （实测：新会话先选档再发消息，服务端请求体无 effort）。会话内显式选档（上面三段）
+    // 优先，全局默认兜底。
+    let e2 = e;
+    if (e2 === undefined) {
+      try {
+        const editor = (this.loopCtx as unknown as { get(n: string): unknown }).get("configEditor") as
+          | { configuration(): Array<{ entry?: { options?: { id?: string } }; override?: Record<string, unknown>; entry2?: never }> }
+          | undefined;
+        const row = editor?.configuration?.().find(r => r.entry?.options?.id === "agent-default-model");
+        const effort = (row?.override as { reasoningEffort?: string } | undefined)?.reasoningEffort;
+        if (effort && /^(off|minimal|low|medium|high|xhigh|max)$/i.test(effort)) e2 = effort.toLowerCase();
+      } catch { /* configEditor 不可用则跳过 */ }
+    }
     if (e && /^(off|minimal|low|medium|high|xhigh|max)/i.test(e)) return e.toLowerCase();
-    return undefined;
+    return e2;
   }
 
   /** 动态注入运行期助手（createScope/agentEvents）后生效；失败则降级为裸事件 */
