@@ -519,8 +519,13 @@ export class GrokBridgeAgent implements Agent {
         }
       },
       onThought: (t: string) => {
+        // 去重（2026-10-07 老大实测"每段显示两次"）：直播翻译（pin 的 <think> 附加流经
+        // splitter 拆出）已经喂过思考区时，grok 回合末再发的完整推理摘要是重复内容——丢弃。
+        if (thoughtChunks.length > 0) {
+          console.log(`[grokcli] thought 去重：丢弃回合末重复摘要 ${t.length}B（直播已展示）`);
+          return;
+        }
         startFrame();
-        console.log(`[grokcli] thought-chunk ${new Date().toISOString().slice(14, 23)} +${t.length}B`); // 思维链外显定位观测（时序）
         thoughtBuf += t;
         thoughtChunks.push(t);
         this.dispatch?.emit("agent/assistant-stream", {
