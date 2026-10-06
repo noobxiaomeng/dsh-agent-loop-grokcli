@@ -45,7 +45,7 @@ const LEVEL_VOCAB = new Set(["off", "minimal", "low", "medium", "high", "xhigh",
  * 注意：modelOverrides 不能与手写 models 共存（pi-ai schema 会拒），故直接装饰条目。
  */
 export async function decorateEfforts(ctx: Context, entries: GrokProfileEntry[]): Promise<void> {
-  const get = (ctx as unknown as { get?: (name: string): unknown }).get?.bind(ctx);
+  const get = (ctx as unknown as { get?: (name: string) => unknown }).get?.bind(ctx);
   // Cordis 铁律：未 inject 的服务 .get 会抛（实测 web 子进程早期会走到这）——整体 try 防御
   let editor: {
     entries(): Array<{ options: { id?: string } }>;

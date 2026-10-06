@@ -5,6 +5,8 @@
  * 的请求体改写为所选模型，其余原样转发（含 SSE 流式与 /v1/models 目录）。
  */
 import { createServer, request as httpRequest } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { request as httpsRequest } from "node:https";
 
 export interface PinTarget {
@@ -153,36 +155,89 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
     const up = send({ hostname: hostport.split(":")[0], port: Number(hostport.split(":")[1] ?? (scheme === "https" ? 443 : 80)), path, method: req.method, headers }, upRes => {
       const outHeaders: Record<string, string | number> = {};
       for (const [k, v] of Object.entries(upRes.headers)) {
-        if (v == null || k === "transfer-encoding" || k === "connection" || k === "keep-alive") continue;
+        // content-length 一并剥离：非流式响应体可能被思维链翻译改写变长
+        if (v == null || k === "transfer-encoding" || k === "connection" || k === "keep-alive" || k === "content-length") continue;
         outHeaders[k] = Array.isArray(v) ? v.join(", ") : v;
       }
       res.writeHead(upRes.statusCode ?? 502, outHeaders);
-      // usage 采集 tee：SSE 逐 data: 行解析终包 usage；JSON 响应整体缓冲后解析。
-      // 边转发边扫，不落盘不改流（对 grok 侧完全透明）。
+      // usage 采集 + 思维链翻译（2026-10-06）：中转 chat 通道把推理放 DeepSeek 风格
+      // delta.reasoning_content，grok CLI 不认识直接丢（实测 UI 只剩 <think> 碎片 20B）。
+      // 这里改写成 content 里的 <think>…</think> 流（首个 rc delta 开标签、首个正文 delta
+      // 闭标签、流末兜底闭合），桥的 makeThinkSplitter 拆到推理流 → UI 完整思维链。
       const isSSE = String(upRes.headers["content-type"] ?? "").includes("text/event-stream");
       if (isSSE) {
         let sseBuf = "";
+        let inThink = false;
         upRes.on("data", (d: Buffer) => {
-          res.write(d);
           sseBuf += d.toString("utf8");
           let idx: number;
+          const out: string[] = [];
           while ((idx = sseBuf.indexOf("\n")) >= 0) {
-            const line = sseBuf.slice(0, idx).trim();
+            const rawLine = sseBuf.slice(0, idx);
             sseBuf = sseBuf.slice(idx + 1);
-            if (!line.startsWith("data:")) continue;
+            const line = rawLine.trim();
+            if (!line.startsWith("data:")) { out.push(rawLine + "\n"); continue; }
             const payload = line.slice(5).trim();
-            if (!payload || payload === "[DONE]") continue;
-            try { recordUsage((JSON.parse(payload) as { usage?: unknown }).usage); } catch { /* 半包/非 JSON 忽略 */ }
+            if (!payload || payload === "[DONE]") { out.push(rawLine + "\n"); continue; }
+            let rewritten = rawLine + "\n";
+            try {
+              const ev = JSON.parse(payload) as { id?: string; object?: string; created?: number; model?: string; usage?: unknown; choices?: Array<{ delta?: Record<string, unknown> }> };
+              // 非 chat-chunk 形状的私货行（无 choices/usage/id——实测中转会夹 {"sequ...} 40KB
+              // 杂行）透传必炸 grok 的严格反序列化：丢弃并记日志。
+              if (!ev.choices && !ev.usage && !ev.id) {
+                console.log(`[grokcli] pin: 丢弃非 chunk 行 (${payload.length}B) ${payload.slice(0, 60)}`);
+                continue;
+              }
+              if (ev.usage) recordUsage(ev.usage);
+              // 中转的 reasoning_content 行常是精简形状（缺 id 等必需字段）——grok 的
+              // ChatCompletionChunk 严格反序列化会炸（实测 missing field `id`）。补全形状。
+              const maybeRc = ev.choices?.[0]?.delta?.reasoning_content ?? ev.choices?.[0]?.delta?.reasoning;
+              if (typeof maybeRc === "string") {
+                if (!ev.id) ev.id = "chatcmpl-pin";
+                if (!ev.object) ev.object = "chat.completion.chunk";
+                if (typeof ev.created !== "number") ev.created = Math.floor(Date.now() / 1000);
+                if (!ev.model) ev.model = target.model;
+              }
+              const delta = ev.choices?.[0]?.delta;
+              // 2026-10-06 实测翻案：xAI chat 协议原生带 reasoning_content 字段，grok CLI
+              // 自己处理（此前中转不吐该字段才误判需要 <think> 翻译——翻译反而破坏原生
+              // 链路：grok 对 <think> 包裹的流报 no_visible_content）。此处只透传不翻译；
+              // 命中 reasoning 字段的行经形状补全后重序列化（保证 id 等必需字段在）。
+              if (delta && typeof delta === "object" && typeof (delta.reasoning_content ?? delta.reasoning) === "string") {
+                rewritten = "data: " + JSON.stringify(ev) + "\n";
+              }
+            } catch { /* 半包/非 JSON 忽略 */ }
+            out.push(rewritten);
           }
+          if (out.length > 0) res.write(out.join(""));
         });
-        upRes.on("end", () => res.end());
+        upRes.on("end", () => {
+          if (inThink) res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "</think>" } }] }) + "\n\n");
+          res.end();
+        });
         upRes.on("error", () => res.end());
       } else {
+        // 非流式：整体缓冲改写（reasoning_content → content 前缀）再发——长度会变，
+        // content-length 头已在 outHeaders 剥离阶段排除（chunked 自动适配）。
         const acc: Buffer[] = [];
-        upRes.on("data", (d: Buffer) => { acc.push(d); res.write(d); });
+        upRes.on("data", (d: Buffer) => { acc.push(d); });
         upRes.on("end", () => {
-          try { recordUsage((JSON.parse(Buffer.concat(acc).toString("utf8")) as { usage?: unknown }).usage); } catch { /* 非 JSON 忽略 */ }
-          res.end();
+          let bodyBuf = Buffer.concat(acc);
+          try {
+            const parsed = JSON.parse(bodyBuf.toString("utf8")) as { usage?: unknown; choices?: Array<{ message?: Record<string, unknown> }> };
+            if (parsed.usage) recordUsage(parsed.usage);
+            const msg = parsed.choices?.[0]?.message;
+            const rc = msg?.reasoning_content ?? msg?.reasoning;
+            if (msg && typeof rc === "string" && rc.length > 0) {
+              const prev = typeof msg.content === "string" ? msg.content : "";
+              msg.content = `<think>${rc}</think>${prev}`;
+              delete msg.reasoning_content;
+              if (msg.reasoning !== undefined) delete msg.reasoning;
+              bodyBuf = Buffer.from(JSON.stringify(parsed), "utf8");
+              console.log(`[grokcli] pin (${req.url}): reasoning_content -> <think> (${rc.length}B)`);
+            }
+          } catch { /* 非 JSON 忽略 */ }
+          res.end(bodyBuf);
         });
         upRes.on("error", () => res.end());
       }
