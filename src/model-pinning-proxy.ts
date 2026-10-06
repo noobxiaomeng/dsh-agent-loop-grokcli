@@ -64,6 +64,14 @@ const pinState: { target: PinTarget | null } = { target: null };
 // 也计入——它们同样烧钱，用户在面板看到的应是整回合真实开销。
 interface OpenAiUsage { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } }
 const usageLog: Array<{ ts: number; usage: OpenAiUsage }> = [];
+type UsageListener = (usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }) => void;
+const usageListeners = new Set<UsageListener>();
+/** 注册逐次 usage 回调（桥用于回合中实时推送 assistant/attempt 流帧）。返回注销器。 */
+export function onPinUsage(cb: UsageListener): () => void {
+  usageListeners.add(cb);
+  return () => { usageListeners.delete(cb); };
+}
+
 function recordUsage(u: unknown): void {
   if (!u || typeof u !== "object") return;
   const o = u as OpenAiUsage & { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
@@ -87,6 +95,17 @@ function recordUsage(u: unknown): void {
   });
   if (usageLog.length > 200) usageLog.splice(0, usageLog.length - 200);
   console.log(`[grokcli] pin-usage captured: +${o.prompt_tokens}in/+${o.completion_tokens}out`);
+  // 逐次通知（实时用量推送）：四桶 = 未缓存输入（prompt 已减缓存）/输出/缓存读/缓存写 0
+  const cached = Number(o.prompt_tokens_details?.cached_tokens ?? 0) || 0;
+  const snapshot = {
+    inputTokens: Math.max(0, (Number(o.prompt_tokens ?? 0) || 0) - cached),
+    outputTokens: Number(o.completion_tokens ?? 0) || 0,
+    cacheReadTokens: cached,
+    cacheWriteTokens: 0,
+  };
+  for (const cb of [...usageListeners]) {
+    try { cb(snapshot); } catch { /* 监听器异常不影响采集 */ }
+  }
 }
 
 /** since(ms) 之后所有响应的 usage 求和 → dsh TokenUsage 口径
@@ -204,6 +223,12 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
         // 另：响应全量落盘 ~/.grokdesk/relay-last-responses.log（覆盖式，复现时看坏数据真身）。
         let buf = "";
         let dumped = false;
+        // 思维链外显直播（2026-10-06）：grok CLI 对 responses 的 reasoning 增量事件不转发为
+        // ACP thought 流（实测推理全程零 thought chunk，回合末才一次性给摘要）。这里把
+        // response.reasoning_summary_text.delta 翻译成附加的 output_text.delta 正文流并包
+        // <think> 标签（首个推理 delta 开标签、首个真正文 delta 闭标签），桥的 makeThinkSplitter
+        // 拆到推理流 → UI 思考区实时增长。原事件保留双发（grok 侧摘要逻辑不受影响）。
+        let thinkLive = false;
         const dumpPath = join(homedir(), ".grokdesk", "relay-last-responses.log");
         const dump = (s: string): void => {
           try {
@@ -241,10 +266,22 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
             const payload = line.slice(5).trim();
             if (!payload || payload === "[DONE]") { out.push(rawLine + "\n"); continue; }
             try {
-              const ev = JSON.parse(payload) as { type?: unknown; code?: unknown; message?: unknown; response?: { usage?: unknown }; usage?: unknown };
+              const ev = JSON.parse(payload) as { type?: unknown; code?: unknown; message?: unknown; delta?: unknown; item_id?: unknown; response?: { usage?: unknown }; usage?: unknown };
               if (typeof ev.type !== "string") {
                 console.log(`[grokcli] pin: 丢弃无 type 行 responses (${payload.length}B) ${payload.slice(0, 60)}`);
                 continue;
+              }
+              // 思维链直播翻译：推理增量 → 附加 <think> 正文 delta；正文 delta 前补闭标签
+              const extra: string[] = [];
+              if (ev.type === "response.reasoning_summary_text.delta" && typeof ev.delta === "string" && ev.delta.length > 0) {
+                const openTag = thinkLive ? "" : "<think>";
+                thinkLive = true;
+                const fake = { content_index: 0, type: "response.output_text.delta", delta: openTag + ev.delta, item_id: ev.item_id ?? "rs_live", output_index: 0, sequence_number: typeof (ev as { sequence_number?: unknown }).sequence_number === "number" ? (ev as { sequence_number: number }).sequence_number : 0 };
+                extra.push("data: " + JSON.stringify(fake) + "\n\n");
+              } else if (ev.type === "response.output_text.delta" && typeof ev.delta === "string" && thinkLive && ev.delta.length > 0) {
+                thinkLive = false;
+                const fake = { content_index: 0, type: "response.output_text.delta", delta: "</think>" + ev.delta, item_id: ev.item_id ?? "msg_live", output_index: 0, sequence_number: typeof (ev as { sequence_number?: unknown }).sequence_number === "number" ? (ev as { sequence_number: number }).sequence_number : 0 };
+                extra.push("data: " + JSON.stringify(fake) + "\n\n");
               }
               let forward = rawLine + "\n";
               if (ev.type === "error" && (ev.code === undefined || ev.message === undefined)) {
@@ -254,6 +291,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                 console.log(`[grokcli] pin: 补全 error 事件字段 (code=${String(ev.code)})`);
               }
               if (ev.response?.usage) recordUsage(ev.response.usage);
+              if (extra.length > 0) out.push(...extra);
               out.push(forward);
             } catch {
               console.log(`[grokcli] pin: 丢弃坏 data 行 responses (${payload.length}B)`);

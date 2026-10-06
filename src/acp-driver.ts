@@ -14,7 +14,7 @@
  * - prompt 的 resolve 即回合结束（stopReason: end_turn|cancelled|...）；
  * - 会话绑定模型进程：换模型/换档位 = 换连接 = 换会话。
  */
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 
@@ -340,7 +340,13 @@ export class AcpDriver {
       const cur = this.sessionInfo.get(acpSessionId);
       if (cur?.pendingPrompt && conn.child) {
         this.log("acp cancel escalation: kill connection", { sid: acpSessionId.slice(0, 8) });
-        try { conn.child.kill(); } catch {}
+        try {
+          // Windows 树杀（/T 连子进程 /F 强制）：child.kill() 对个别场景失效（ECONNRESET
+          // 孤儿实测），taskkill 兜底
+          const pid = conn.child.pid;
+          conn.child.kill();
+          if (pid) { try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* 已死则忽略 */ } }
+        } catch {}
       }
       void info;
     }, 8_000).unref?.();
@@ -482,7 +488,13 @@ export class AcpDriver {
     this.permWaiters.clear();
     for (const [, conn] of this.pool) {
       if (conn.child) {
-        try { conn.child.kill(); } catch {}
+        try {
+          // Windows 树杀（/T 连子进程 /F 强制）：child.kill() 对个别场景失效（ECONNRESET
+          // 孤儿实测），taskkill 兜底
+          const pid = conn.child.pid;
+          conn.child.kill();
+          if (pid) { try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* 已死则忽略 */ } }
+        } catch {}
       }
     }
     this.pool.clear();

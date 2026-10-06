@@ -24,6 +24,7 @@ import type { Session, SessionEvent, SessionId } from "@deepseek-ai/dsh-session/
 import type { UserMessage, AssistantMessage, ToolResultMessage, ContentBlock } from "@deepseek-ai/dsh-llm/types.ts";
 import { AcpDriver, type AcpSessionUpdate, type AcpPermissionRequest, type AcpPermissionDecision } from "./acp-driver.ts";
 import { decideRoute, syncGrokProfiles, type GrokProfileEntry } from "./profile-router.ts";
+import { onPinUsage } from "./model-pinning-proxy.ts";
 import { readPiAiProfiles, decorateEfforts } from "./settings-bridge.ts";
 import { ModelPinningProxy, usageSince } from "./model-pinning-proxy.ts";
 import { SubagentMirror, type SubagentSpawnSpec } from "./subagent-mirror.ts";
@@ -519,6 +520,7 @@ export class GrokBridgeAgent implements Agent {
       },
       onThought: (t: string) => {
         startFrame();
+        console.log(`[grokcli] thought-chunk ${new Date().toISOString().slice(14, 23)} +${t.length}B`); // 思维链外显定位观测（时序）
         thoughtBuf += t;
         thoughtChunks.push(t);
         this.dispatch?.emit("agent/assistant-stream", {
@@ -630,6 +632,19 @@ export class GrokBridgeAgent implements Agent {
       },
     };
 
+    // 实时用量推送（2026-10-06）：pin 每采到一次模型请求 usage，就 append 一个带 usage 流帧
+    // 的 assistant/attempt——tokenUsage 投影 fold 它（lastAssistantStreamChunk(stream,'usage')），
+    // StatsPills 的 Token/缓存命中/tok·s 随每次模型请求实时刷新（此前要等回合收尾的
+    // assistant/message）。不带 surfaceOp（白名单外事件携带会毒会话）。
+    const unlistenUsage = onPinUsage(u => {
+      try {
+        this.session.append("assistant/attempt", {
+          turn, step,
+          stream: [{ type: "chunk", time: Date.now(), chunk: { type: "usage", usage: u } }],
+        } as never);
+      } catch (e) { console.log(`[grokcli] live usage append failed: ${String(e).slice(0, 80)}`); }
+    });
+
     let stopReason = "end_turn";
     let failure: string | null = null;
     this.lastRetry = null;
@@ -672,12 +687,21 @@ export class GrokBridgeAgent implements Agent {
       if (!this.cancelRequested && this.acpSessionId && failure) {
         void this.driver.cancel(this.acpSessionId).catch(() => {});
       }
+      // 连接类致命错误（ECONNRESET/ECONNREFUSED/socket hang up——中转断连，2026-10-06 实测
+      // 孤儿路径）：连接已断 cancel 通知送不到，grok 侧正在跑的生成就是孤儿——dispose 杀进程。
+      if (failure && /ECONNRESET|ECONNREFUSED|socket hang up|EPIPE/i.test(failure)) {
+        console.log("[grokcli] 连接类致命错误 -> dispose 杀 grok 进程（防孤儿）");
+        try { this.driver.dispose(); } catch { /* 已销毁则忽略 */ }
+        this.acpSessionId = null;
+        this.boundSpawnKey = "";
+      }
       if (/^ACP session\/prompt timeout/.test(failure)) {
         failure = "回合超时：长时间无任何模型输出，已放弃等待并自动停止 grok 侧任务"
           + "（模型正常工作时有持续输出不会触发；此情况多为中转/网络卡死，可重试或新建会话）";
       }
       if (this.cancelRequested) stopReason = "cancelled";
     } finally {
+      unlistenUsage();
       this.activeTurnContext = null;
     }
     // 重试止损 → 解释性错误（否则用户只看到静默中断，不知道要改哪里）。
