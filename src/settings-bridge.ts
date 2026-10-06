@@ -45,13 +45,18 @@ const LEVEL_VOCAB = new Set(["off", "minimal", "low", "medium", "high", "xhigh",
  * 注意：modelOverrides 不能与手写 models 共存（pi-ai schema 会拒），故直接装饰条目。
  */
 export async function decorateEfforts(ctx: Context, entries: GrokProfileEntry[]): Promise<void> {
-  const get = (ctx as unknown as { get?: (name: string) => unknown }).get?.bind(ctx);
-  const editor = get?.("configEditor") as
-    | { entries(): Array<{ options: { id?: string } }>; edit(entry: unknown, change: (current: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>): Promise<void> }
-    | undefined;
+  const get = (ctx as unknown as { get?: (name: string): unknown }).get?.bind(ctx);
+  // Cordis 铁律：未 inject 的服务 .get 会抛（实测 web 子进程早期会走到这）——整体 try 防御
+  let editor: {
+    entries(): Array<{ options: { id?: string } }>;
+    edit(entry: unknown, change: (current: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>): Promise<void>;
+  } | undefined;
+  try { editor = get?.("configEditor") as typeof editor; } catch { return; }
   if (!editor?.entries) return;
   const entry = editor.entries().find(r => r.options?.id === "llm-pi-ai");
   if (!entry) return;
+  // 2026-10-06 稳定性二分：edit 调用疑致 web 子进程死亡（TypeError 伴随每次启动），
+  // 诊断期禁用写回——档位装饰已有持久化，功能不受损。
 
   for (const e of entries) {
     if (!e.baseUrl || !e.apiKey) continue;
@@ -72,14 +77,10 @@ export async function decorateEfforts(ctx: Context, entries: GrokProfileEntry[])
         }
       }
     } catch { /* 目录拉不到就跳过装饰 */ }
-    // 兜底（2026-10-06）：目录拉不到/为空（中转欠费 403、网络抖动）时，对 grok 系模型用
-    // 已知词表硬编码装饰——否则 UI 保存设置会重写 providers 段（装饰字段丢失），而欠费期
-    // 的重新装饰补不回来 → 模型选择器只剩模型名、档位菜单消失（实测踩坑）。
-    if (!effortsByModel || effortsByModel.size === 0) {
-      if (!/^grok/i.test(e.baseUrl)) continue;
-      effortsByModel = new Map(e.models.map(m => [m, ["low", "medium", "high", "xhigh"]]));
-      console.log(`[grokcli] effort 装饰走硬编码兜底（中转目录不可达）：${e.models.join(",")}`);
-    }
+    // 目录拉不到/为空：跳过装饰（写回走宿主 configEditor——web 子进程早期未就绪时调用
+    // 会损伤宿主内部状态，实测疑致 web 进程 ~1 分钟内死亡，2026-10-06 撤；档位元数据已
+    // 持久化在 profile patch，欠费期丢失的场景靠下次成功装饰自愈）。
+    if (!effortsByModel || effortsByModel.size === 0) continue;
 
     // 2) 差分写回（仅补缺失/不同的 reasoningEfforts，绝不动清单成员与其他字段）
     let changed = false;
