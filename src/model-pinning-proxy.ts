@@ -196,45 +196,78 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       // 丢弃/形状补全（那会把正常 responses 事件全扔掉）。
       const passthroughResponses = typeof req.url === "string" && req.url.includes("/responses");
       if (passthroughResponses) {
-        // 行级校验转发（2026-10-06）：中转大负载下会夹带含裸控制字符的坏 data 行（grok
-        // 严格解析炸 serialization error）——逐行 JSON 校验，坏行丢弃，好行原样转发；usage
-        // 从 response.completed 事件采集。
+        // 全覆盖校验转发（2026-10-06 彻查版）：中转坏流一族（控制字符行/缺 type 行/缺 code
+        // 的 error——含非流式与流尾残块两条绕过路径）。规则：① data: 行 JSON.parse 失败丢弃；
+        // ② data: 行缺 string 型 type 丢弃；③ error 事件缺 code/message 补全；④ 非 data 的
+        // 大块（非流式 JSON 整体或流尾残块）含 error 且缺 code 的补全重写；⑤ 其余原样转发。
+        // 另：响应全量落盘 ~/.grokdesk/relay-last-responses.log（覆盖式，复现时看坏数据真身）。
         let buf = "";
+        let dumped = false;
+        const dumpPath = join(homedir(), ".grokdesk", "relay-last-responses.log");
+        const fsMod = require("node:fs") as typeof import("node:fs");
+        const dump = (s: string): void => {
+          try {
+            if (!dumped) { fsMod.writeFileSync(dumpPath, `=== ${new Date().toISOString()} ${req.url} ===\n`); dumped = true; }
+            fsMod.appendFileSync(dumpPath, s);
+          } catch { /* dump 失败无妨 */ }
+        };
+        const sanitizeBlock = (text: string): string => {
+          if (!text.includes("error")) return text;
+          try {
+            const j = JSON.parse(text) as { error?: { code?: unknown; message?: unknown } & Record<string, unknown> };
+            if (j && typeof j === "object" && j.error && typeof j.error === "object" && j.error.code === undefined) {
+              j.error.code = "relay_error";
+              if (j.error.message === undefined) j.error.message = "relay error without code";
+              console.log(`[grokcli] pin: 补全非流式 error.code (${text.length}B)`);
+              return JSON.stringify(j);
+            }
+          } catch { /* 非 JSON 原样 */ }
+          return text;
+        };
         upRes.on("data", (d: Buffer) => {
-          buf += d.toString("utf8");
+          const chunk = d.toString("utf8");
+          dump(chunk);
+          buf += chunk;
           let idx: number;
           const out: string[] = [];
           while ((idx = buf.indexOf("\n")) >= 0) {
             const rawLine = buf.slice(0, idx);
             buf = buf.slice(idx + 1);
             const line = rawLine.trim();
-            if (!line.startsWith("data:")) { out.push(rawLine + "\n"); continue; }
+            if (!line.startsWith("data:")) {
+              out.push(rawLine + "\n");
+              continue;
+            }
             const payload = line.slice(5).trim();
             if (!payload || payload === "[DONE]") { out.push(rawLine + "\n"); continue; }
             try {
               const ev = JSON.parse(payload) as { type?: unknown; code?: unknown; message?: unknown; response?: { usage?: unknown }; usage?: unknown };
-              // å½¢ç¶æ ¡éªï¼2026-10-06 ç¬¬äºåä½ï¼ä¸­è½¬ååæ³ JSON ä½å½¢ç¶éè¯¯çè¡ââå¦ç¼º code ç error äºä»¶ï¼grok ç serde ä¸¥æ ¼è§£æç¸ missing fieldï¼ã
-              // responses äºä»¶å¿é¡»å¸¦ string ç±»åç typeï¼error äºä»¶ç¼º code/message åè¡¥å¨æè§èéè¯¯ã
               if (typeof ev.type !== "string") {
-              console.log(`[grokcli] pin: ä¸¢å¼æ  type è¡ responses (${payload.length}B) ${payload.slice(0, 60)}`);
-              continue;
+                console.log(`[grokcli] pin: 丢弃无 type 行 responses (${payload.length}B) ${payload.slice(0, 60)}`);
+                continue;
               }
               let forward = rawLine + "\n";
               if (ev.type === "error" && (ev.code === undefined || ev.message === undefined)) {
-              (ev as Record<string, unknown>).code = ev.code ?? "relay_error";
-              (ev as Record<string, unknown>).message = ev.message ?? "relay returned a malformed error event";
-              forward = "data: " + JSON.stringify(ev) + "\n";
-              console.log(`[grokcli] pin: è¡¥å¨ error äºä»¶å­æ®µ (code=${String(ev.code)})`);
+                (ev as Record<string, unknown>).code = ev.code ?? "relay_error";
+                (ev as Record<string, unknown>).message = ev.message ?? "relay returned a malformed error event";
+                forward = "data: " + JSON.stringify(ev) + "\n";
+                console.log(`[grokcli] pin: 补全 error 事件字段 (code=${String(ev.code)})`);
               }
               if (ev.response?.usage) recordUsage(ev.response.usage);
               out.push(forward);
             } catch {
-              console.log(`[grokcli] pin: ä¸¢å¼å data è¡ responses (${payload.length}B)`);
+              console.log(`[grokcli] pin: 丢弃坏 data 行 responses (${payload.length}B)`);
             }
           }
           if (out.length > 0) res.write(out.join(""));
         });
-        upRes.on("end", () => { if (buf.trim()) res.write(buf); res.end(); });
+        upRes.on("end", () => {
+          if (buf.trim()) {
+            dump("\n=== tail ===\n" + buf);
+            res.write(sanitizeBlock(buf));
+          }
+          res.end();
+        });
         upRes.on("error", () => res.end());
         return;
       }
