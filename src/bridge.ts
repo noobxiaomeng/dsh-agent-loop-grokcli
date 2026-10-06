@@ -690,6 +690,10 @@ export class GrokBridgeAgent implements Agent {
         + "或点「新建会话」重开（grok 侧会话已自动重置）。";
       stopReason = "cancelled";
       this.acpSessionId = null;
+      // 连接一并销毁（杀 grok 子进程）：cancel 只是通知，grok 可能继续跑（老大实测止损后
+      // 服务端仍在烧 API）；8s 强杀的触发条件是「请求仍挂着」，止损时请求已结束永远不触发
+      // ——孤儿 grok 继续生成。止损本就丢弃会话，连接没有保留价值，直接 dispose 一了百了。
+      try { this.driver.dispose(); } catch { /* 已销毁则忽略 */ }
       this.boundSpawnKey = "";
     }
 
