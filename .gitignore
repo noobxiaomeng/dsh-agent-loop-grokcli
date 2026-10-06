@@ -5,3 +5,5 @@ grok-session-map.json
 overlay.yml
 overlay-src.yml
 smoke-lib.mjs
+fix*.py
+impl*.py
