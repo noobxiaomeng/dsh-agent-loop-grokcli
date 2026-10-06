@@ -2,7 +2,7 @@
 
 ![GrokDesk](assets/brand-mark-128.png)
 
-**GrokDesk by noobxiaomeng** —— 把 [GrokCLI](https://x.ai/)（xAI grok CLI）注册为 [dsh](https://github.com/deepseek-ai)（DeepSeek Harness）主引擎的桥插件。装上这个插件，dsh 桌面/Web 的所有对话、工具执行、子代理全部由你本机的 grok 驱动，侧栏品牌位变成 GrokDesk。
+**GrokDesk by noobxiaomeng** —— 把 [GrokCLI](https://x.ai/)（xAI grok CLI）注册为 [dsh](https://github.com/deepseek-ai)（DeepSeek Harness）主引擎的桥插件。装上这个插件，dsh 桌面/Web 的所有对话、工具执行、子代理全部由你本机的 grok 驱动。
 
 ## 特性
 
@@ -12,7 +12,6 @@
 - **子代理会话镜像**：grok 原生 `spawn_subagent` 的子会话实时镜像成 dsh 会话（侧栏独立分组、可回放、运行中可只读浏览）
 - **设置桥**：dsh 设置 → 模型 → 自定义模型 API 填的 baseURL/key 自动翻译成 grok 档案
 - **跨重启恢复**：会话绑定落边车，重启 dsh 后 grok 上下文无缝恢复
-- **品牌位**：侧栏顶部图标与署名（本插件自带浏览器客户端模块）
 
 ## 前置要求
 
@@ -30,7 +29,7 @@
    github:noobxiaomeng/dsh-agent-loop-grokcli
    ```
    （或直接贴 git URL `https://github.com/noobxiaomeng/dsh-agent-loop-grokcli`）
-3. 点安装，重启 dsh。侧栏出现 GrokDesk 品牌即成功。
+3. 点安装，重启 dsh 即生效。
 
 ### 方式二：CLI（web/tui profile）
 
