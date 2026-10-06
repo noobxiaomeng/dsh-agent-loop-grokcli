@@ -22,7 +22,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GrokBridgeFactory, type BridgeConfig } from "./bridge.ts";
@@ -206,6 +206,7 @@ async function deleteSessionCompletely(ctx: Context, sessionId: string): Promise
   let registry: {
     archiveSession?(id: string, o?: Record<string, unknown>): Promise<void>;
     unarchiveSession?(id: string): Promise<void>;
+    resolveByPath?(path: string): Promise<unknown>;
   } | undefined;
   try { registry = (ctx as unknown as { get(n: string): unknown }).get("workspaceRegistry") as typeof registry; } catch { registry = undefined; }
   const notes: string[] = [];
@@ -221,12 +222,22 @@ async function deleteSessionCompletely(ctx: Context, sessionId: string): Promise
   for (const fn of [`${sessionId}.json`, `${sessionId.replace(/^session-/, "")}.json`]) {
     try { rmSync(join(projcacheDir, fn), { force: true }); } catch { /* 条目可缺 */ }
   }
-  // unarchive 延迟一拍：archive 的归档集推送先让前端把行过滤掉（archivedSet 是响应式），
-  // 立刻 unarchive 会让前端只见到最终态（归档集外+成员账目残项）——幽灵行当场复活
-  // （实测踩坑）。8s 后清归档集，残项由后续 workspace mutation prune。
-  setTimeout(() => {
-    void registry?.unarchiveSession?.(sessionId).catch(() => {});
-  }, 8_000);
+  // 账目根除（2026-10-06 复活案修复）：磁盘删了但 workspace 成员账目（sessionIds）还挂着
+  // 时，归档集一清残项就在普通列表复活（老大实测「删了又蹦出来」）。detachSession 把 id
+  // 从账目摘除——mutate 链还会顺带 prune 其它失去成员资格的幽灵候选。之后 unarchive 清
+  // 归档集即彻底消失（无需再延迟：账目已无，无处复活）。
+  try {
+    const wsFile = join(homedir(), ".dsh", "storages", "workspace.json");
+    const data = JSON.parse(readFileSync(wsFile, "utf-8")) as { tables?: { workspaces?: Record<string, { path?: string; sessionIds?: string[] }> } };
+    for (const w of Object.values(data.tables?.workspaces ?? {})) {
+      if (Array.isArray(w?.sessionIds) && w.sessionIds.includes(sessionId) && w.path) {
+        const entity = await registry?.resolveByPath?.(w.path) as { detachSession?(id: string): Promise<void> } | undefined;
+        await entity?.detachSession?.(sessionId);
+        console.log(`[grokcli] session detached from workspace ${String(w.path).slice(-30)}`);
+      }
+    }
+  } catch (e) { notes.push(`detach: ${String(e).slice(0, 90)}`); }
+  try { await registry?.unarchiveSession?.(sessionId); } catch { /* 归档集里没有该 id 时会拒，无妨 */ }
   console.log(`[grokcli] session deleted: ${sessionId.slice(0, 18)} dir=${removedDir}${notes.length ? ` notes=${notes.join("; ")}` : ""}`);
   return { ok: true, removedDir, notes };
 }
