@@ -124,13 +124,15 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
             notes.push(`model ${parsed.model} -> ${target.model}`);
             parsed.model = target.model;
           }
-          if (target.effort && parsed.reasoning_effort === undefined && parsed.reasoning === undefined) {
+          const isResponsesApi = typeof req.url === "string" && req.url.includes("/responses");
+          if (!isResponsesApi && target.effort && parsed.reasoning_effort === undefined && parsed.reasoning === undefined) {
             parsed.reasoning_effort = target.effort;
             notes.push(`reasoning_effort=${target.effort} injected`);
           }
           // usage 采集（2026-10-05）：OpenAI 兼容体只在显式要求时才在流式终包带 usage；
           // 非流式响应默认带，无需注入。若上游拒认此参数会 4xx——冒烟/回归即暴露。
-          if (parsed.stream === true && parsed.stream_options?.include_usage !== true) {
+          // stream_options 是 chat 协议参数——responses API 不认（实测 500），只对 chat 注入
+          if (!isResponsesApi && parsed.stream === true && parsed.stream_options?.include_usage !== true) {
             parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };
             notes.push("stream_options.include_usage injected");
           }
@@ -141,7 +143,10 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
         }
       } catch { /* 非 JSON 体原样转发 */ }
     }
-    // 目标 URL：把真实 base 的路径拼回（base 含 /v1；进来的 path 也带 /v1）
+    // 目标 URL：把真实 base 的路径拼回（base 含 /v1；进来的 path 也带 /v1）。
+    // 端点型 upstreamBase（老大 2026-10-06 指正：xcmapi 的 responses 接入地址是
+    // .../v1/responses 完整端点）——直接打该端点不再拼路径，否则 /responses 会叠成
+    // /responses/responses。
     const m = /^(https?):\/\/([^/]+)(\/.*)?$/.exec(target.upstreamBase.replace(/\/+$/, ""));
     if (!m) {
       res.writeHead(502, { "content-type": "application/json" });
@@ -149,7 +154,10 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       return;
     }
     const [, scheme, hostport, basePath = ""] = m;
-    const path = req.url && req.url.startsWith("/v1") ? basePath + req.url.slice(3) : basePath + (req.url || "");
+    const endpointTyped = /\/(responses|chat\/completions)$/.test(basePath);
+    const path = endpointTyped
+      ? basePath
+      : req.url && req.url.startsWith("/v1") ? basePath + req.url.slice(3) : basePath + (req.url || "");
     const send = scheme === "https" ? httpsRequest : httpRequest;
     const headers = { ...req.headers, host: hostport, "content-length": String(body.length) };
     const up = send({ hostname: hostport.split(":")[0], port: Number(hostport.split(":")[1] ?? (scheme === "https" ? 443 : 80)), path, method: req.method, headers }, upRes => {
@@ -165,6 +173,29 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       // 这里改写成 content 里的 <think>…</think> 流（首个 rc delta 开标签、首个正文 delta
       // 闭标签、流末兜底闭合），桥的 makeThinkSplitter 拆到推理流 → UI 完整思维链。
       const isSSE = String(upRes.headers["content-type"] ?? "").includes("text/event-stream");
+      // responses 端点的响应是 responses 协议事件流（response.*），grok 原生解析——
+      // 转发器只透传+采 usage（response.completed 事件带 usage），不做 chat 层的杂行
+      // 丢弃/形状补全（那会把正常 responses 事件全扔掉）。
+      const passthroughResponses = typeof req.url === "string" && req.url.includes("/responses");
+      if (passthroughResponses) {
+        let acc2 = "";
+        upRes.on("data", (d: Buffer) => {
+          res.write(d);
+          acc2 += d.toString("utf8");
+          let i2: number;
+          while ((i2 = acc2.indexOf("\n")) >= 0) {
+            const l2 = acc2.slice(0, i2).trim();
+            acc2 = acc2.slice(i2 + 1);
+            if (!l2.startsWith("data:")) continue;
+            const p2 = l2.slice(5).trim();
+            if (!p2 || p2 === "[DONE]") continue;
+            try { recordUsage((JSON.parse(p2) as { response?: { usage?: unknown }; usage?: unknown }).response?.usage); } catch { /* 忽略 */ }
+          }
+        });
+        upRes.on("end", () => res.end());
+        upRes.on("error", () => res.end());
+        return;
+      }
       if (isSSE) {
         let sseBuf = "";
         let inThink = false;
