@@ -5,6 +5,7 @@
  * 的请求体改写为所选模型，其余原样转发（含 SSE 流式与 /v1/models 目录）。
  */
 import { createServer, request as httpRequest } from "node:http";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { request as httpsRequest } from "node:https";
@@ -204,11 +205,10 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
         let buf = "";
         let dumped = false;
         const dumpPath = join(homedir(), ".grokdesk", "relay-last-responses.log");
-        const fsMod = require("node:fs") as typeof import("node:fs");
         const dump = (s: string): void => {
           try {
-            if (!dumped) { fsMod.writeFileSync(dumpPath, `=== ${new Date().toISOString()} ${req.url} ===\n`); dumped = true; }
-            fsMod.appendFileSync(dumpPath, s);
+            if (!dumped) { writeFileSync(dumpPath, `=== ${new Date().toISOString()} ${req.url} ===\n`); dumped = true; }
+            appendFileSync(dumpPath, s);
           } catch { /* dump 失败无妨 */ }
         };
         const sanitizeBlock = (text: string): string => {
