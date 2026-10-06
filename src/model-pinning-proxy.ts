@@ -212,11 +212,24 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
             const payload = line.slice(5).trim();
             if (!payload || payload === "[DONE]") { out.push(rawLine + "\n"); continue; }
             try {
-              const ev = JSON.parse(payload) as { response?: { usage?: unknown }; usage?: unknown };
+              const ev = JSON.parse(payload) as { type?: unknown; code?: unknown; message?: unknown; response?: { usage?: unknown }; usage?: unknown };
+              // å½¢ç¶æ ¡éªï¼2026-10-06 ç¬¬äºåä½ï¼ä¸­è½¬ååæ³ JSON ä½å½¢ç¶éè¯¯çè¡ââå¦ç¼º code ç error äºä»¶ï¼grok ç serde ä¸¥æ ¼è§£æç¸ missing fieldï¼ã
+              // responses äºä»¶å¿é¡»å¸¦ string ç±»åç typeï¼error äºä»¶ç¼º code/message åè¡¥å¨æè§èéè¯¯ã
+              if (typeof ev.type !== "string") {
+              console.log(`[grokcli] pin: ä¸¢å¼æ  type è¡ responses (${payload.length}B) ${payload.slice(0, 60)}`);
+              continue;
+              }
+              let forward = rawLine + "\n";
+              if (ev.type === "error" && (ev.code === undefined || ev.message === undefined)) {
+              (ev as Record<string, unknown>).code = ev.code ?? "relay_error";
+              (ev as Record<string, unknown>).message = ev.message ?? "relay returned a malformed error event";
+              forward = "data: " + JSON.stringify(ev) + "\n";
+              console.log(`[grokcli] pin: è¡¥å¨ error äºä»¶å­æ®µ (code=${String(ev.code)})`);
+              }
               if (ev.response?.usage) recordUsage(ev.response.usage);
-              out.push(rawLine + "\n");
+              out.push(forward);
             } catch {
-              console.log(`[grokcli] pin: 丢弃坏 data 行 responses (${payload.length}B)`);
+              console.log(`[grokcli] pin: ä¸¢å¼å data è¡ responses (${payload.length}B)`);
             }
           }
           if (out.length > 0) res.write(out.join(""));
