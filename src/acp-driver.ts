@@ -94,9 +94,9 @@ export interface AcpSpawnOptions {
   retryAbortMs?: number;
   /** 同类重试到 N 次即止损（默认 5 次，约 60-70s；grok 退避节奏实测） */
   retryAbortAttempts?: number;
-  /** 瞬态错误（上游 5xx/超时/限流/网络抖动）止损次数（默认 8；等待常自愈，2026-10-08 放宽） */
+  /** 瞬态错误（上游 5xx/超时/限流/网络抖动）止损次数（默认 10；等待常自愈，2026-10-08 老大定标） */
   retryTransientAttempts?: number;
-  /** 瞬态错误止损时长（默认 300s=5 分钟） */
+  /** 瞬态错误止损时长（默认 600s=10 分钟） */
   retryTransientMs?: number;
   /** prompt 空闲超时 ms（默认 600s：会话有任何新流量即续期。实测 grok-4.7@xhigh 长探索
    *  回合可合法跑 16 分钟+，固定 600s 会把正常回合误杀成 "ACP session/prompt timeout"） */
@@ -108,9 +108,9 @@ export interface AcpSpawnOptions {
 
 const DEFAULT_ABORT_MS = 120_000;
 const DEFAULT_ABORT_ATTEMPTS = 5;
-/** 瞬态错误（上游 5xx/超时/限流）的放宽止损预算：等待常能自愈 */
-const DEFAULT_TRANSIENT_MS = 300_000;
-const DEFAULT_TRANSIENT_ATTEMPTS = 8;
+/** 瞬态错误（上游 5xx/超时/限流）的放宽止损预算：等待常能自愈（老大定标 10 次 / 10 分钟） */
+const DEFAULT_TRANSIENT_MS = 600_000;
+const DEFAULT_TRANSIENT_ATTEMPTS = 10;
 const PERM_TIMEOUT_MS = 180_000;
 /** 只经 _x.ai/session_notification 送达、session/update 不送的 update 类别（抓线实证；
  *  其余类别两通道都会送，放行会造成双投递 → 重复 tool/call → 冷读取判损坏） */
@@ -475,7 +475,7 @@ export class AcpDriver {
     info.retry = retry;
     this.handlers.onRetryState(sid, retry);
     // 双保险止损，按错误可恢复性分类给预算（2026-10-08 老人反馈"重试 1 次太少"放宽）：
-    // - 瞬态类（上游 5xx/超时/限流/网络抖动）：等待往往自愈——8 次 / 5 分钟才止损，
+    // - 瞬态类（上游 5xx/超时/限流/网络抖动）：等待往往自愈——10 次 / 10 分钟才止损，
     //   期间 grok 的回合内退避重试成功则任务无感继续。
     // - 硬错误类（鉴权/协议/参数）：重试无意义——维持紧止损 5 次 / 120s 快速失败。
     // 实测教训（紧止损的由来）：中转返回空响应/鉴权失败时 grok 会无限指数退避，
