@@ -271,8 +271,13 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                 console.log(`[grokcli] pin: 丢弃无 type 行 responses (${payload.length}B) ${payload.slice(0, 60)}`);
                 continue;
               }
-              // 思维链直播翻译：推理增量 → 附加 <think> 正文 delta；正文 delta 前补闭标签
+              // 思维链直播翻译：推理增量 → 附加 <think> 正文 delta；正文 delta 前补闭标签。
+              // 首个真正文 delta 的闭标签 fake **替换**原事件转发（fake 已含其全部文本）——
+              // 若再叠加原事件，grok 会把同一 delta 双转发 → 正文首 token 重复（2026-10-07
+              // 实锄件：段首「先先」「任务任务」）。推理 delta 的开标签 fake 仍是双发（原
+              // reasoning 事件 grok 不转发为正文、只用于其回合末摘要，保留无害）。
               const extra: string[] = [];
+              let replaced = false;
               if (ev.type === "response.reasoning_summary_text.delta" && typeof ev.delta === "string" && ev.delta.length > 0) {
                 const openTag = thinkLive ? "" : "<think>";
                 thinkLive = true;
@@ -282,6 +287,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                 thinkLive = false;
                 const fake = { content_index: 0, type: "response.output_text.delta", delta: "</think>" + ev.delta, item_id: ev.item_id ?? "msg_live", output_index: 0, sequence_number: typeof (ev as { sequence_number?: unknown }).sequence_number === "number" ? (ev as { sequence_number: number }).sequence_number : 0 };
                 extra.push("data: " + JSON.stringify(fake) + "\n\n");
+                replaced = true;
               }
               let forward = rawLine + "\n";
               if (ev.type === "error" && (ev.code === undefined || ev.message === undefined)) {
@@ -292,7 +298,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
               }
               if (ev.response?.usage) recordUsage(ev.response.usage);
               if (extra.length > 0) out.push(...extra);
-              out.push(forward);
+              if (!replaced) out.push(forward);
             } catch {
               console.log(`[grokcli] pin: 丢弃坏 data 行 responses (${payload.length}B)`);
             }
@@ -351,7 +357,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                 rewritten = "data: " + JSON.stringify(ev) + "\n";
               }
             } catch {
-              // 坏行防御（2026-10-06 实测踩坑：中转大负载下会夹带含裸控制字符  -
+              // 坏行防御（2026-10-06 实测踩坑：中转大负载下会夹带含裸控制字符 \u0000-\u001f
               // 的 data 行，grok 严格 JSON 解析直接炸整回合 serialization error）——解析失败
               // 的 data 行一律丢弃不透传（SSE 的 data 行按协议必须全是合法 JSON，丢的是坏行）。
               console.log(`[grokcli] pin: 丢弃坏 data 行 (${payload.length}B)`);

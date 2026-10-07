@@ -428,11 +428,16 @@ export class GrokBridgeAgent implements Agent {
     this.setStatus("running");
     const text = blocksToText(userMessage.content);
     const turn = this.lastTurnNumber() + 1;
-    const step = 1;
 
     this.session.append("turn/start", { turn });
     this.session.append("user/message", userMessage, { surfaceOp: "append" });
-    this.session.append("step/start", { turn, step });
+    // step 懒开（2026-10-07 混合回合修复）：dsh 原生语义 = 一次模型请求一个 step
+    // （agent-loop/src/agent.ts 的 while 循环，step/start → 请求 → 工具 → step/end）。
+    // grok 的 response_completed 是「单次模型请求」边界（协议实录：文本流 →
+    // response_completed → tool_call → 下一轮文本流），据此切段；工具事件开自己的 step。
+    // 此前整回合塞一个 step，UI 的 assistant 节点按 turn:step 聚合且锚定段内首个可见块
+    // ——混合回合的文本节点锚在回合顶部、工具卡排其后（顺序错乱=问题 B），工具后的新
+    // 文本又汇入同一节点（视觉整块=问题 A 的结构成分）。
 
     const wantModel = this.effectiveModel();
     const entries = await this.modelSource.profiles();
@@ -481,7 +486,7 @@ export class GrokBridgeAgent implements Agent {
         // 绑定落边车 map（dsh 会话日志不接受未知事件类型——实测毒化会话，observe 直接拒绝）
         this.modelSource.saveBinding(this.id, this.acpSessionId, spawnKey, wantModel);
       } catch (e) {
-        this.failTurn(turn, step, `grok session create failed: ${String(e)}`);
+        this.failTurn(turn, `grok session create failed: ${String(e)}`);
         return;
       }
     }
@@ -489,9 +494,14 @@ export class GrokBridgeAgent implements Agent {
     // 流式累积器 + <think> 拆分状态机：部分中转（如 xcmapi.org 的 chat 通道）把推理
     // 内容以 <think>...</think> 形式混在 content 流里，这里实时拆分：think 段走推理流
     // （agent_thought_chunk 语义），闭合后的正文走消息流，UI 不再显示原始标签。
-    const splitter = makeThinkSplitter();
+    // 拆分器按段（=按模型请求）重建：pin 翻译器的 <think> 状态机是每请求一轮，段边界
+    // 正好是标签周期边界。
+    let splitter = makeThinkSplitter();
+    const turnTime0 = Date.now(); // 回合级 usage 统计窗口（段计时器 time0 每段重置）
     this.currentAttempt += 1;
-    const attemptId = `grok-${this.currentAttempt}-${randomUUID().slice(0, 8)}` as never;
+    const attemptBase = `grok-${this.currentAttempt}-${randomUUID().slice(0, 8)}` as never;
+    let attemptId = attemptBase;
+    let attemptSeq = 0; // 段号（attemptId 后缀），跨段递增
     this.revision += 1;
     const revision = this.revision;
     let textBuf = "";
@@ -499,30 +509,115 @@ export class GrokBridgeAgent implements Agent {
     const textChunks: string[] = [];
     const thoughtChunks: string[] = [];
     const textDt: number[] = [];
-    const time0 = Date.now();
+    let time0 = Date.now();
+    let anyLiveThought = false; // 全回合级：直播翻译喂过思考区 → 回合末 grok 摘要去重
     let streamStarted = false;
+    let anyDurableContent = false; // 本回合是否已有任何 durable 内容（空回合兜底消息用）
     // 直播帧序号（2026-10-07 UI 整块问题真凶）：UI 的 SessionAssistantStreamAccumulator
-    // 要求 dense frames 的 revision 与 index 每帧严格递增（start 后 chunk 依次 r+1/r+2...、
-    // index 0,1,2...）——此前桥发固定 revision/index，第二帧起全被折叠器丢弃，UI 只能等
-    // 回合落库整块渲染。按发射顺序计数。
+    // 要求 dense frames 的 revision 每帧严格递增——revision 全回合连续计数（跨段不重置，
+    // 宿主折叠器按邻接校验；跨回合重置为 1 时宿主有专门的 reset 特例）；index 每段从
+    // 0 重开（客户端 fold 按 attempt 各自从 0 计数）。
     let frameSeq = 0;
+    let chunkIdx = 0;
+    // step 懒开懒关：开 = 首个需要 durable 落点的事件（段首块/工具调用）；关 = 段收口后
+    // 且工具全结算（v4 校验器：step/end 前所有 tool/call 必须已有 tool/result）。
+    let stepNo = 0;
+    let stepOpen = false;
+    const openStep = (): number => {
+      if (!stepOpen) {
+        stepNo += 1;
+        this.session.append("step/start", { turn, step: stepNo });
+        stepOpen = true;
+      }
+      return stepNo;
+    };
+    const maybeCloseStep = (): void => {
+      // 有活跃 attempt 时不能关：settle 的 assistant/message 必须落在开启的 step 里。
+      if (!stepOpen || streamStarted || pendingTools.size > 0) return;
+      this.session.append("step/end", { turn, step: stepNo });
+      stepOpen = false;
+    };
     const startFrame = () => {
       if (!streamStarted) {
         streamStarted = true;
-        frameSeq = 1;
-        this.dispatch?.emit("agent/assistant-stream", { frame: { type: "start", attemptId, revision: frameSeq, turn, step } });
+        chunkIdx = 0;
+        attemptSeq += 1;
+        attemptId = `${attemptBase}#s${attemptSeq}` as never;
+        frameSeq += 1;
+        this.dispatch?.emit("agent/assistant-stream", { frame: { type: "start", attemptId, revision: frameSeq, turn, step: stepNo } });
       }
     };
-    const frameMeta = (): { revision: number; index: number } => { frameSeq += 1; return { revision: frameSeq, index: frameSeq - 2 }; };
+    const frameMeta = (): { revision: number; index: number } => { frameSeq += 1; chunkIdx += 1; return { revision: frameSeq, index: chunkIdx - 1 }; };
+    // 实时 usage 队列（2026-10-07 rebaseline 毒化修复）：attempt 活跃期间落 assistant/
+    // attempt 会被客户端 fold 暂存成 pending 且永不释放（end 帧只结算 assistant/message
+    // 的 seq）→ 下一个 start 帧触发 rebaseline 重连、直播断流。只在段收口（attempt 已
+    // 关、step 未关）时冲刷。
+    const usageQueue: Array<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number }> = [];
+    let flushedUsageAny = false;
+    const flushUsage = (): void => {
+      if (usageQueue.length === 0) return;
+      if (!stepOpen) { usageQueue.length = 0; return; } // 校验器要求开启 step；无处落则丢弃
+      for (const u of usageQueue) {
+        try {
+          this.session.append("assistant/attempt", {
+            turn, step: stepNo,
+            stream: [{ type: "chunk", time: Date.now(), chunk: { type: "usage", usage: u } }],
+          } as never);
+        } catch (e) { console.log(`[grokcli] live usage append failed: ${String(e).slice(0, 80)}`); }
+      }
+      usageQueue.length = 0;
+      flushedUsageAny = true;
+    };
+    /** 段收口：冲刷拆分器 → durable assistant/message → end(committed) 帧 → usage 冲刷 →
+     *  step 收口（工具全结算时）。interrupted 段带 interrupted 落库（客户端即时退休
+     *  transient 行）。空段（无帧）为 no-op。 */
+    const settleSegment = (opts: { interrupted?: boolean } = {}): void => {
+      for (const piece of splitter.flush()) {
+        if (piece.kind === "thought") { thoughtBuf += piece.text; thoughtChunks.push(piece.text); }
+        else if (piece.text) { textBuf += piece.text; textChunks.push(piece.text); textDt.push(Date.now() - time0); }
+      }
+      if (!streamStarted) return;
+      streamStarted = false;
+      const content: ContentBlock[] = [];
+      if (thoughtBuf) content.push({ type: "reasoning", text: thoughtBuf } as ContentBlock);
+      if (textBuf || content.length === 0) content.push({ type: "text", text: textBuf || "(empty segment)" } as ContentBlock);
+      const assistantMessage: AssistantMessage = {
+        id: `asst-${randomUUID().slice(0, 8)}` as never,
+        role: "assistant",
+        content,
+        source: { kind: "model", provider: PROVIDER, model: this.boundWantModel || route.model || "grok" },
+      };
+      const stream: unknown[] = [];
+      if (thoughtChunks.length) stream.push({ type: "reasoning-chunks", time0, index: 1, dt: thoughtChunks.map((_, i) => i), texts: thoughtChunks });
+      if (textChunks.length) stream.push({ type: "text-chunks", time0, index: 0, dt: textDt, texts: textChunks });
+      const appended = this.session.append("assistant/message", {
+        turn, step: stepNo, message: assistantMessage, stream,
+        ...(opts.interrupted ? { interrupted: true } : {}),
+      } as never, { surfaceOp: "append" });
+      anyDurableContent = true;
+      frameSeq += 1;
+      this.dispatch?.emit("agent/assistant-stream", {
+        frame: { type: "end", attemptId, revision: frameSeq, index: chunkIdx, outcome: { kind: "committed", eventType: "assistant/message", seq: appended.seq } },
+      });
+      console.log(`[grokcli] segment#${attemptSeq} settled: step=${stepNo} text=${textBuf.length}B think=${thoughtBuf.length}B seq=${appended.seq}`);
+      flushUsage();
+      maybeCloseStep();
+      // 段缓冲重置
+      splitter = makeThinkSplitter();
+      textBuf = ""; thoughtBuf = ""; textChunks.length = 0; thoughtChunks.length = 0; textDt.length = 0;
+      time0 = Date.now();
+    };
     const pendingTools = new Map<string, { name: string; arguments: string; callSeq?: number }>();
 
     this.activeTurnContext = {
-      turn, step, attemptId,
+      turn, step: 0, attemptId: attemptBase, // step 实际由 openStep 懒分配（见上）
       onText: (t: string) => {
-      console.log(`[grokcli] text-chunk ${new Date().toISOString().slice(14, 23)} +${t.length}B`); // 流式诊断观测
+        console.log(`[grokcli] text-chunk ${new Date().toISOString().slice(14, 23)} +${t.length}B`); // 流式诊断观测
+        openStep();
         startFrame();
         for (const piece of splitter.feed(t)) {
           if (piece.kind === "thought") {
+            anyLiveThought = true;
             thoughtBuf += piece.text;
             thoughtChunks.push(piece.text);
             this.dispatch?.emit("agent/assistant-stream", {
@@ -541,10 +636,11 @@ export class GrokBridgeAgent implements Agent {
       onThought: (t: string) => {
         // 去重（2026-10-07 老大实测"每段显示两次"）：直播翻译（pin 的 <think> 附加流经
         // splitter 拆出）已经喂过思考区时，grok 回合末再发的完整推理摘要是重复内容——丢弃。
-        if (thoughtChunks.length > 0) {
+        if (anyLiveThought) {
           console.log(`[grokcli] thought 去重：丢弃回合末重复摘要 ${t.length}B（直播已展示）`);
           return;
         }
+        openStep();
         startFrame();
         thoughtBuf += t;
         thoughtChunks.push(t);
@@ -553,6 +649,10 @@ export class GrokBridgeAgent implements Agent {
         });
       },
       onToolCall: (callId: string, title: string, rawInput: string) => {
+        // 工具调用 = 段边界（协议实录：response_completed 之后才到 tool_call）。防御：
+        // 若 grok 把 tool_call 发在 response_completed 之前，先强制收口当前流式段。
+        settleSegment();
+        openStep();
         const name = title || "tool";
         const args = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput ?? {});
         // ask_user_question 纯兜底位（不弹卡！）：_x.ai/ask_user_question 协议请求才是唯一
@@ -601,10 +701,10 @@ export class GrokBridgeAgent implements Agent {
           content: [{ type: "tool-call", id: callId as never, name, arguments: args } as ContentBlock],
           source: { kind: "model", provider: PROVIDER, model: this.boundWantModel || route.model || "grok" },
         };
-        this.session.append("assistant/message", { turn, step, message: advMessage, stream: [] } as never, { surfaceOp: "append" });
+        this.session.append("assistant/message", { turn, step: stepNo, message: advMessage, stream: [] } as never, { surfaceOp: "append" });
         // 记下 tool/call 的 seq：tool/result 的 sourceEventSeqs 必须引用它（dsh 事件配对契约，
         // 对齐原生 agent-loop tool-calls.ts 的 appendToolResult 做法）
-        const ev = this.session.append("tool/call", { turn, step, callId: callId as never, name, arguments: args }) as unknown as { seq?: number };
+        const ev = this.session.append("tool/call", { turn, step: stepNo, callId: callId as never, name, arguments: args }) as unknown as { seq?: number };
         pendingTools.set(callId, { name, arguments: args, callSeq: ev?.seq });
       },
       onToolUpdate: (callId: string, status?: string, title?: string, content?: unknown, locations?: unknown) => {
@@ -625,7 +725,7 @@ export class GrokBridgeAgent implements Agent {
           ...(failed ? { isError: true } : {}),
         };
         this.session.append("tool/result", {
-          turn, step, message,
+          turn, step: stepNo, message,
           ...(failed ? { error: { name: "GrokToolError", code: "GROK_TOOL_FAILED", ...(title ? { reason: title } : {}) } } : {}),
           ...(Array.isArray(locations) && locations.length > 0 ? { meta: { locations } } : {}),
         } as never, {
@@ -633,11 +733,14 @@ export class GrokBridgeAgent implements Agent {
           ...(rec.callSeq !== undefined ? { sourceEventSeqs: [rec.callSeq] as never } : {}),
         });
         console.log(`[grokcli] tool/result ${String(callId).slice(0, 8)} status=${status} text=${text.length}B${Array.isArray(locations) && locations.length ? ` loc=${locations.length}` : ""}`);
+        // 最后一个工具结算后收口工具 step（无活跃流式段时）——被推迟的段边界在此补上
+        maybeCloseStep();
       },
       // 交互工具（ask_user_question/exit_plan_mode）走 _x.ai 协议应答收口，grok 不再发
       // 终态 tool_call_update → tool/call 永远 pending：UI 工具卡「运行中」不收、问答投影
       // 卡不关、composer 被锁（实测 1.0.49）。协议应答后按工具名补写配对 tool/result。
       settleToolByName: (name: string, text: string) => {
+        openStep(); // pending 工具会保持 step 开启；防御性确保
         for (const [callId, rec] of [...pendingTools]) {
           if (rec.name !== name) continue;
           pendingTools.delete(callId);
@@ -648,26 +751,29 @@ export class GrokBridgeAgent implements Agent {
             source: { kind: "tool", callId: callId as never },
             toolCallId: callId as never,
           };
-          this.session.append("tool/result", { turn, step, message } as never, {
+          this.session.append("tool/result", { turn, step: stepNo, message } as never, {
             surfaceOp: "append",
             ...(rec.callSeq !== undefined ? { sourceEventSeqs: [rec.callSeq] as never } : {}),
           });
           console.log(`[grokcli] interactive tool settled: ${name} ${String(callId).slice(0, 8)} text=${text.length}B`);
         }
+        maybeCloseStep();
+      },
+      // 单次模型请求边界（协议实录：文本流 → response_completed → tool_call → …）：
+      // 收口当前流式段。grok 侧工具执行与其后下一轮文本都从新 step 开始。
+      onResponseCompleted: (_usage?: unknown) => {
+        settleSegment();
       },
     };
 
-    // 实时用量推送（2026-10-06）：pin 每采到一次模型请求 usage，就 append 一个带 usage 流帧
-    // 的 assistant/attempt——tokenUsage 投影 fold 它（lastAssistantStreamChunk(stream,'usage')），
-    // StatsPills 的 Token/缓存命中/tok·s 随每次模型请求实时刷新（此前要等回合收尾的
-    // assistant/message）。不带 surfaceOp（白名单外事件携带会毒会话）。
+    // 实时用量推送（2026-10-06 起，2026-10-07 改队列）：pin 每采到一次模型请求 usage 就
+    // 入队，段收口时（attempt 已关、step 未关）冲刷成带 usage 流帧的 assistant/attempt——
+    // tokenUsage 投影 fold 它（lastAssistantStreamChunk(stream,'usage')），StatsPills 的
+    // Token/缓存命中/tok·s 随每次模型请求实时刷新。不带 surfaceOp（白名单外事件携带会
+    // 毒会话）。之所以必须排队：attempt 活跃期间落库会被客户端 fold 暂存 pending 且永不
+    // 释放 → 下个 start 帧 rebaseline 重连（见 usageQueue 声明处注释）。
     const unlistenUsage = onPinUsage(u => {
-      try {
-        this.session.append("assistant/attempt", {
-          turn, step,
-          stream: [{ type: "chunk", time: Date.now(), chunk: { type: "usage", usage: u } }],
-        } as never);
-      } catch (e) { console.log(`[grokcli] live usage append failed: ${String(e).slice(0, 80)}`); }
+      usageQueue.push(u);
     });
 
     let stopReason = "end_turn";
@@ -746,15 +852,35 @@ export class GrokBridgeAgent implements Agent {
       this.boundSpawnKey = "";
     }
 
-    // 流末残余冲刷（未闭合的 think 段按推理计）
-    for (const piece of splitter.flush()) {
-      if (piece.kind === "thought") { thoughtBuf += piece.text; thoughtChunks.push(piece.text); }
-      else if (piece.text) { textBuf += piece.text; textChunks.push(piece.text); textDt.push(Date.now() - time0); }
-    }
-    // 计划审批收口：批准→计划上屏+自动排队实施；拒绝/超时→计划留档收口。
-    // plan-Active 的 grok 会话对后续编辑只读（文档明示），一律弃用，下条消息全新会话。
+    // 回合尾收口：最后一段 settle（cancelled → interrupted 位落库，客户端即时退休
+    // transient 行）→ 交互收口/兜底消息 → 工具闭合 → step/turn 收口
+    settleSegment({ interrupted: stopReason === "cancelled" });
     if (this.planExitTimer) { clearTimeout(this.planExitTimer); this.planExitTimer = null; }
     if (this.askTimer) { clearTimeout(this.askTimer); this.askTimer = null; }
+    // usage/成本（第二步③）：pin 代理在请求层采集（含 grok 的辅助请求），回合窗口求和；
+    // TokenUsage 四桶口径：inputTokens=未缓存输入（prompt_tokens 已含缓存，要减）
+    let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number } | null = null;
+    try { usage = this.modelSource.usageSince?.(turnTime0) ?? null; } catch { usage = null; }
+    if (usage) console.log(`[grokcli] usage: in=${usage.inputTokens} cacheR=${usage.cacheReadTokens} out=${usage.outputTokens} total=${usage.totalTokens}`);
+    /** 尾部兜底/收口消息：无活跃 attempt，durable append 直接上屏（不经 fold 暂存） */
+    const appendTailMessage = (text: string): void => {
+      openStep();
+      const message: AssistantMessage = {
+        id: `asst-${randomUUID().slice(0, 8)}` as never,
+        role: "assistant",
+        content: [{ type: "text", text } as ContentBlock],
+        source: { kind: "model", provider: PROVIDER, model: this.boundWantModel || route.model || "grok" },
+      };
+      this.session.append("assistant/message", {
+        turn, step: stepNo, message,
+        // 本回合已冲刷过段级 usage 时不带总量（tokenUsage 投影按 turn:step 槽位替换累加，
+        // 尾消息若开新 step 再带总量会把已计的段用量重复叠加）
+        ...(!flushedUsageAny && usage ? { usage } : {}),
+      } as never, { surfaceOp: "append" });
+      anyDurableContent = true;
+    };
+    // 计划审批收口：批准→计划上屏+自动排队实施；拒绝/超时→计划留档收口。
+    // plan-Active 的 grok 会话对后续编辑只读（文档明示），一律弃用，下条消息全新会话。
     if (this.askAnswer !== null || this.askStuck) {
       // ask_user_question 收口：面板点选→答案自动回传同会话续跑；回退→问题上屏等打字
       stopReason = "end_turn";
@@ -763,7 +889,7 @@ export class GrokBridgeAgent implements Agent {
       this.boundSpawnKey = "";
       const q = extractAskQuestion(this.askRawInput);
       if (this.askAnswer !== null) {
-        textBuf = `❓→✅ grok 的提问（已在面板点选作答）：\n\n---\n${q}\n---\n\n你的选择：**${this.askAnswer}**\n（已自动发回同一 grok 会话，任务继续——见下一条消息）`;
+        appendTailMessage(`❓→✅ grok 的提问（已在面板点选作答）：\n\n---\n${q}\n---\n\n你的选择：**${this.askAnswer}**\n（已自动发回同一 grok 会话，任务继续——见下一条消息）`);
         const impl = {
           id: `user-ask-${randomUUID().slice(0, 8)}` as never,
           role: "user",
@@ -773,12 +899,10 @@ export class GrokBridgeAgent implements Agent {
         this.queue.push(impl);
         console.log("[grokcli] ask answered -> auto-continue queued (same grok session)");
       } else {
-        textBuf = "❓ grok 在等你回答以下问题（该工具在桥接环境没有输入框，回合已自动收口）。\n\n"
+        appendTailMessage("❓ grok 在等你回答以下问题（该工具在桥接环境没有输入框，回合已自动收口）。\n\n"
           + "请**直接在输入框回复**，你的回答会带回同一个 grok 会话继续任务：\n\n---\n"
-          + q + "\n---";
+          + q + "\n---");
       }
-      textChunks.length = 0;
-      textDt.length = 0;
       console.log(`[grokcli] ask_user_question closed: ${this.askAnswer !== null ? "answered" : "fallback-text"}`);
     } else if (this.planDecision !== null || this.planStuck) {
       const plan = this.planText;
@@ -787,7 +911,7 @@ export class GrokBridgeAgent implements Agent {
       this.acpSessionId = null;
       this.boundSpawnKey = "";
       if (this.planDecision === "approved") {
-        textBuf = `✅ 计划已批准（原 grok 会话已收口，自动开始实施——见下一条消息）：\n\n---\n${plan ?? "（未找到 plan.md）"}\n---`;
+        appendTailMessage(`✅ 计划已批准（原 grok 会话已收口，自动开始实施——见下一条消息）：\n\n---\n${plan ?? "（未找到 plan.md）"}\n---`);
         if (plan) {
           const impl = {
             id: `user-plan-${randomUUID().slice(0, 8)}` as never,
@@ -799,45 +923,17 @@ export class GrokBridgeAgent implements Agent {
         }
       } else {
         const why = this.planStuck ? "等待审批超时（15 分钟），已自动收口" : "你拒绝了该计划";
-        textBuf = `⚠️ grok 进入计划模式并等待审批，${why}。\n\n计划全文留档（该 grok 会话已弃用，下条消息从全新会话开始；要执行请把要点贴回来）：\n\n---\n${plan ?? "（未找到 plan.md）"}\n---`;
+        appendTailMessage(`⚠️ grok 进入计划模式并等待审批，${why}。\n\n计划全文留档（该 grok 会话已弃用，下条消息从全新会话开始；要执行请把要点贴回来）：\n\n---\n${plan ?? "（未找到 plan.md）"}\n---`);
       }
-      textChunks.length = 0;
-      textDt.length = 0;
       console.log(`[grokcli] plan flow closed: decision=${this.planDecision ?? "timeout"} plan=${plan ? `${plan.length}B` : "missing"}${this.planDecision === "approved" ? " -> auto-implement queued" : ""}`);
+    } else if (!anyDurableContent) {
+      // 空回合兜底（正常回合各段已落 assistant/message；失败详情由 turn/end error 呈现）
+      appendTailMessage(failure ? `⚠️ ${failure}` : "(empty)");
     }
-    console.log(`[grokcli] turn tail: stop=${stopReason} failure=${failure ? failure.slice(0, 60) : "-"} text=${textBuf.length}B think=${thoughtBuf.length}B`);
+    console.log(`[grokcli] turn tail: stop=${stopReason} failure=${failure ? failure.slice(0, 60) : "-"} segments=${attemptSeq} steps=${stepNo}`);
 
-    // usage/成本（第二步③）：pin 代理在请求层采集（含 grok 的辅助请求），回合窗口求和；
-    // TokenUsage 四桶口径：inputTokens=未缓存输入（prompt_tokens 已含缓存，要减）
-    let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; totalTokens: number } | null = null;
-    try { usage = this.modelSource.usageSince?.(time0) ?? null; } catch { usage = null; }
-    if (usage) console.log(`[grokcli] usage: in=${usage.inputTokens} cacheR=${usage.cacheReadTokens} out=${usage.outputTokens} total=${usage.totalTokens}`);
-
-    // durable assistant/message（必须先于 end(committed) 帧）
-    const content: ContentBlock[] = [];
-    if (thoughtBuf) content.push({ type: "reasoning", text: thoughtBuf } as ContentBlock);
-    if (textBuf || content.length === 0) content.push({ type: "text", text: textBuf || (failure ? `⚠️ ${failure}` : "(empty)") } as ContentBlock);
-    const assistantMessage: AssistantMessage = {
-      id: `asst-${randomUUID().slice(0, 8)}` as never,
-      role: "assistant",
-      content,
-      source: { kind: "model", provider: PROVIDER, model: this.boundWantModel || route.model || "grok" },
-    };
-    const stream: unknown[] = [];
-    if (thoughtChunks.length) stream.push({ type: "reasoning-chunks", time0, index: 1, dt: thoughtChunks.map((_, i) => i), texts: thoughtChunks });
-    if (textChunks.length) stream.push({ type: "text-chunks", time0, index: 0, dt: textDt, texts: textChunks });
-    const appended = this.session.append("assistant/message", {
-      turn, step, message: assistantMessage, stream,
-      ...(usage ? { usage } : {}),
-      ...(stopReason === "cancelled" ? { interrupted: true } : {}),
-    } as never, { surfaceOp: "append" });
-    console.log(`[grokcli] turn tail: assistant/message appended seq=${appended.seq}`);
-
-    this.dispatch?.emit("agent/assistant-stream", {
-      frame: (() => { frameSeq += 1; return { type: "end", attemptId, revision: frameSeq, index: frameSeq - 2, outcome: { kind: "committed", eventType: "assistant/message", seq: appended.seq } }; })(),
-    });
-
-    // 未闭合的工具调用补失败结果（turn 结束前必须闭合）
+    flushUsage();
+    // 未闭合的工具调用补失败结果（turn 结束前必须闭合；v4 校验器要求 step/end 前全结算）
     for (const [callId] of pendingTools) {
       const message: ToolResultMessage = {
         id: `tool-${randomUUID().slice(0, 8)}` as never,
@@ -847,10 +943,10 @@ export class GrokBridgeAgent implements Agent {
         toolCallId: callId as never,
         isError: true,
       };
-      this.session.append("tool/result", { turn, step, message } as never, { surfaceOp: "append" });
+      this.session.append("tool/result", { turn, step: stepNo, message } as never, { surfaceOp: "append" });
     }
-
-    this.session.append("step/end", { turn, step });
+    pendingTools.clear();
+    maybeCloseStep();
     this.session.append("turn/end", { turn, reason: stopReasonToEndReason(stopReason, failure) } as never);
     console.log(`[grokcli] turn tail: turn/end appended`);
     this.setStatus("idle");
@@ -863,10 +959,13 @@ export class GrokBridgeAgent implements Agent {
     onToolCall(callId: string, title: string, rawInput: string): void;
     onToolUpdate(callId: string, status?: string, title?: string, content?: unknown, locations?: unknown): void;
     settleToolByName(name: string, text: string): void;
+    /** 单次模型请求边界（response_completed）：收口当前流式段 */
+    onResponseCompleted(usage?: unknown): void;
   } | null = null;
 
-  private failTurn(turn: number, step: number, message: string) {
-    this.session.append("step/end", { turn, step });
+  private failTurn(turn: number, message: string) {
+    // 会话创建失败发生在任何 step 开启之前（step 懒开）——不补 step/end（v4 校验器：
+    // step/end 必须匹配开启中的 step），直接 turn/end error 收口。
     this.session.append("turn/end", { turn, reason: { kind: "error", error: { message, code: "grok_bridge_error" } } } as never);
     this.setStatus("idle");
   }
@@ -942,8 +1041,13 @@ export class GrokBridgeAgent implements Agent {
         c.onToolUpdate(toolCallId, status, title, content, locations);
         return;
       }
+      case "response_completed": {
+        // 单次模型请求边界（经 _x.ai/session_notification 通道送达，抓线实证）：收口段
+        c.onResponseCompleted((u as { usage?: unknown }).usage);
+        return;
+      }
       default:
-        return; // session_info_update / available_commands_update 等暂忽略
+        return; // session_info_update / available_commands_update / turn_completed 等暂忽略
     }
   }
 
