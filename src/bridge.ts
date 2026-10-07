@@ -353,6 +353,18 @@ export class GrokBridgeAgent implements Agent {
   }
   inject(message: UserMessage): void { this.send(message, "next-step", false); }
 
+  /** 前端「释放引擎」按钮的服务端执行体：断开本会话的 grok 连接（杀进程），上下文在
+   *  磁盘，下条消息自动重连恢复。多会话挂机时按需释放空闲引擎。 */
+  shutdownEngine(): void {
+    if (this.boundSpawnKey || this.acpSessionId) {
+      console.log(`[grokcli] engine shutdown by user (session ${String(this.id).slice(0, 18)})`);
+      try { this.driver.dispose(); } catch { /* 已销毁 */ }
+      this.acpSessionId = null;
+      this.boundSpawnKey = "";
+      this.restoreBinding = this.lookupBinding(this.id);
+    }
+  }
+
   cancel(_cause: unknown, _options?: unknown): void {
     this.cancelRequested = true;
     if (this.acpSessionId) {
@@ -489,31 +501,39 @@ export class GrokBridgeAgent implements Agent {
     const textDt: number[] = [];
     const time0 = Date.now();
     let streamStarted = false;
+    // 直播帧序号（2026-10-07 UI 整块问题真凶）：UI 的 SessionAssistantStreamAccumulator
+    // 要求 dense frames 的 revision 与 index 每帧严格递增（start 后 chunk 依次 r+1/r+2...、
+    // index 0,1,2...）——此前桥发固定 revision/index，第二帧起全被折叠器丢弃，UI 只能等
+    // 回合落库整块渲染。按发射顺序计数。
+    let frameSeq = 0;
     const startFrame = () => {
       if (!streamStarted) {
         streamStarted = true;
-        this.dispatch?.emit("agent/assistant-stream", { frame: { type: "start", attemptId, revision, turn, step } });
+        frameSeq = 1;
+        this.dispatch?.emit("agent/assistant-stream", { frame: { type: "start", attemptId, revision: frameSeq, turn, step } });
       }
     };
+    const frameMeta = (): { revision: number; index: number } => { frameSeq += 1; return { revision: frameSeq, index: frameSeq - 2 }; };
     const pendingTools = new Map<string, { name: string; arguments: string; callSeq?: number }>();
 
     this.activeTurnContext = {
       turn, step, attemptId,
       onText: (t: string) => {
+      console.log(`[grokcli] text-chunk ${new Date().toISOString().slice(14, 23)} +${t.length}B`); // 流式诊断观测
         startFrame();
         for (const piece of splitter.feed(t)) {
           if (piece.kind === "thought") {
             thoughtBuf += piece.text;
             thoughtChunks.push(piece.text);
             this.dispatch?.emit("agent/assistant-stream", {
-              frame: { type: "chunk", attemptId, revision, index: 1, time: Date.now(), chunk: { type: "reasoning-delta", index: 1, text: piece.text } },
+              frame: { type: "chunk", attemptId, ...frameMeta(), time: Date.now(), chunk: { type: "reasoning-delta", index: 1, text: piece.text } },
             });
           } else if (piece.text) {
             textBuf += piece.text;
             textChunks.push(piece.text);
             textDt.push(Date.now() - time0);
             this.dispatch?.emit("agent/assistant-stream", {
-              frame: { type: "chunk", attemptId, revision, index: 0, time: Date.now(), chunk: { type: "text-delta", index: 0, text: piece.text } },
+              frame: { type: "chunk", attemptId, ...frameMeta(), time: Date.now(), chunk: { type: "text-delta", index: 0, text: piece.text } },
             });
           }
         }
@@ -529,7 +549,7 @@ export class GrokBridgeAgent implements Agent {
         thoughtBuf += t;
         thoughtChunks.push(t);
         this.dispatch?.emit("agent/assistant-stream", {
-          frame: { type: "chunk", attemptId, revision, index: 1, time: Date.now(), chunk: { type: "reasoning-delta", index: 1, text: t } },
+          frame: { type: "chunk", attemptId, ...frameMeta(), time: Date.now(), chunk: { type: "reasoning-delta", index: 1, text: t } },
         });
       },
       onToolCall: (callId: string, title: string, rawInput: string) => {
@@ -814,7 +834,7 @@ export class GrokBridgeAgent implements Agent {
     console.log(`[grokcli] turn tail: assistant/message appended seq=${appended.seq}`);
 
     this.dispatch?.emit("agent/assistant-stream", {
-      frame: { type: "end", attemptId, revision, index: 0, outcome: { kind: "committed", eventType: "assistant/message", seq: appended.seq } },
+      frame: (() => { frameSeq += 1; return { type: "end", attemptId, revision: frameSeq, index: frameSeq - 2, outcome: { kind: "committed", eventType: "assistant/message", seq: appended.seq } }; })(),
     });
 
     // 未闭合的工具调用补失败结果（turn 结束前必须闭合）

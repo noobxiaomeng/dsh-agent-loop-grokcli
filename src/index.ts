@@ -103,6 +103,33 @@ export function apply(ctx: Context, config: BridgeConfig) {
   ctx.inject(["webServer"], (webCtx: Context) => {
     webCtx.effect(() => webCtx.webServer.register({
       kind: "exact",
+      path: "/grokdesk/engine-control",
+      handler: async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += String(chunk);
+        let sessionId = "";
+        try { sessionId = String((JSON.parse(body) || {}).sessionId ?? ""); } catch { /* bad json */ }
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        if (!/^session-[0-9a-f-]{30,}$/i.test(sessionId)) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ ok: false, error: "bad sessionId" }));
+          return;
+        }
+        try {
+          const agent = webCtx.agents.get(sessionId as never) as unknown as { shutdownEngine?: () => void } | undefined;
+          if (!agent?.shutdownEngine) {
+            res.end(JSON.stringify({ ok: false, error: "会话无活跃引擎（可能未发过消息）" }));
+            return;
+          }
+          agent.shutdownEngine();
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.end(JSON.stringify({ ok: false, error: String(e).slice(0, 120) }));
+        }
+      },
+    }), "grokcli.engine-control route");
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: "exact",
       path: "/grokdesk/delete-session",
       handler: async (req, res) => {
         let body = "";
