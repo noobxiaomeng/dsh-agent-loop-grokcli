@@ -22,7 +22,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentHandle, AgentFactory, AgentOptions, AgentStatus, Inbox, InboxTarget } from "@deepseek-ai/dsh-agent/types.ts";
 import type { Session, SessionEvent, SessionId } from "@deepseek-ai/dsh-session/types.ts";
 import type { UserMessage, AssistantMessage, ToolResultMessage, ContentBlock } from "@deepseek-ai/dsh-llm/types.ts";
-import { AcpDriver, type AcpSessionUpdate, type AcpPermissionRequest, type AcpPermissionDecision } from "./acp-driver.ts";
+import { AcpDriver, isTransientRetryReason, type AcpSessionUpdate, type AcpPermissionRequest, type AcpPermissionDecision } from "./acp-driver.ts";
 import { decideRoute, syncGrokProfiles, type GrokProfileEntry } from "./profile-router.ts";
 import { onPinUsage } from "./model-pinning-proxy.ts";
 import { readPiAiProfiles, decorateEfforts } from "./settings-bridge.ts";
@@ -836,20 +836,35 @@ export class GrokBridgeAgent implements Agent {
       this.activeTurnContext = null;
     }
     // 重试止损 → 解释性错误（否则用户只看到静默中断，不知道要改哪里）。
-    // 同时丢弃当前 grok 会话：no_visible_content 的常见根因是 grok 侧会话上下文
-    // 被污染/过大（中转对大会话回空），止损后下回合自动 session/new 重建。
     const abortedRetry = this.driver.retryAbortedOf(this.acpSessionId);
     if (abortedRetry) {
-      failure = `模型通道异常已自动止损：${abortedRetry.reason}（重试 ${abortedRetry.attempt} 次无进展）。`
-        + "多为中转/密钥/协议不匹配或会话上下文过大——请到 设置→模型→编辑 提供商 核对密钥/换协议，"
-        + "或点「新建会话」重开（grok 侧会话已自动重置）。";
-      stopReason = "cancelled";
-      this.acpSessionId = null;
-      // 连接一并销毁（杀 grok 子进程）：cancel 只是通知，grok 可能继续跑（老大实测止损后
-      // 服务端仍在烧 API）；8s 强杀的触发条件是「请求仍挂着」，止损时请求已结束永远不触发
-      // ——孤儿 grok 继续生成。止损本就丢弃会话，连接没有保留价值，直接 dispose 一了百了。
-      try { this.driver.dispose(); } catch { /* 已销毁则忽略 */ }
-      this.boundSpawnKey = "";
+      const transient = isTransientRetryReason(abortedRetry.reason);
+      if (transient) {
+        // 瞬态类（上游 5xx/超时/限流）：通道问题不是会话问题——**保留 grok 会话上下文**
+        // （restoreBinding 指回当前会话），用户直接重发消息即自动重连恢复、接着任务干。
+        const keepSid = this.acpSessionId;
+        failure = `模型通道临时故障已自动止损：${abortedRetry.reason}（已重试 ${abortedRetry.attempt} 次仍无恢复）。`
+          + "上下文已保留——请稍后**直接重发这条消息**，会自动重连并从原进度继续（无需新建会话；若持续失败再考虑新建或检查中转）。";
+        stopReason = "cancelled";
+        this.acpSessionId = null;
+        try { this.driver.dispose(); } catch { /* 已销毁则忽略 */ }
+        this.boundSpawnKey = "";
+        if (keepSid) this.restoreBinding = { grokSessionId: keepSid }; // 下条消息 loadSession 恢复上下文
+        console.log(`[grokcli] transient abort: binding kept for reconnect (grok session ${keepSid?.slice(0, 8)})`);
+      } else {
+        // 硬错误类：止损后丢弃当前 grok 会话。no_visible_content 等常见根因是会话上下文
+        // 被污染/过大（中转对大会话回空），丢弃后下回合自动 session/new 重建。
+        failure = `模型通道异常已自动止损：${abortedRetry.reason}（重试 ${abortedRetry.attempt} 次无进展）。`
+          + "多为中转/密钥/协议不匹配或会话上下文过大——请到 设置→模型→编辑 提供商 核对密钥/换协议，"
+          + "或点「新建会话」重开（grok 侧会话已自动重置）。";
+        stopReason = "cancelled";
+        this.acpSessionId = null;
+        // 连接一并销毁（杀 grok 子进程）：cancel 只是通知，grok 可能继续跑（老大实测止损后
+        // 服务端仍在烧 API）；8s 强杀的触发条件是「请求仍挂着」，止损时请求已结束永远不触发
+        // ——孤儿 grok 继续生成。止损本就丢弃会话，连接没有保留价值，直接 dispose 一了百了。
+        try { this.driver.dispose(); } catch { /* 已销毁则忽略 */ }
+        this.boundSpawnKey = "";
+      }
     }
 
     // 回合尾收口：最后一段 settle（cancelled → interrupted 位落库，客户端即时退休

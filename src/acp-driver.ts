@@ -90,10 +90,14 @@ export interface AcpSpawnOptions {
   modelProfile?: string;
   /** 思考档位（-e）：low|high|xhigh...；进程级参数，进连接键 */
   reasoningEffort?: string;
-  /** retry 止损阈值（默认 120s） */
+  /** retry 止损阈值（默认 120s；硬错误类：鉴权/协议/参数，重试无意义快速失败） */
   retryAbortMs?: number;
   /** 同类重试到 N 次即止损（默认 5 次，约 60-70s；grok 退避节奏实测） */
   retryAbortAttempts?: number;
+  /** 瞬态错误（上游 5xx/超时/限流/网络抖动）止损次数（默认 8；等待常自愈，2026-10-08 放宽） */
+  retryTransientAttempts?: number;
+  /** 瞬态错误止损时长（默认 300s=5 分钟） */
+  retryTransientMs?: number;
   /** prompt 空闲超时 ms（默认 600s：会话有任何新流量即续期。实测 grok-4.7@xhigh 长探索
    *  回合可合法跑 16 分钟+，固定 600s 会把正常回合误杀成 "ACP session/prompt timeout"） */
   promptIdleMs?: number;
@@ -104,10 +108,20 @@ export interface AcpSpawnOptions {
 
 const DEFAULT_ABORT_MS = 120_000;
 const DEFAULT_ABORT_ATTEMPTS = 5;
+/** 瞬态错误（上游 5xx/超时/限流）的放宽止损预算：等待常能自愈 */
+const DEFAULT_TRANSIENT_MS = 300_000;
+const DEFAULT_TRANSIENT_ATTEMPTS = 8;
 const PERM_TIMEOUT_MS = 180_000;
 /** 只经 _x.ai/session_notification 送达、session/update 不送的 update 类别（抓线实证；
  *  其余类别两通道都会送，放行会造成双投递 → 重复 tool/call → 冷读取判损坏） */
 const NOTIFICATION_ONLY_KINDS = new Set(["response_completed", "turn_completed", "turn_started", "subagent_spawned", "subagent_progress", "session_summary_generated"]);
+
+/** 瞬态错误判定（上游 5xx/超时/限流/网络抖动）：等待常自愈，止损预算放宽；
+ *  鉴权/协议/参数类硬错误重试无意义，维持紧止损。bridge 侧同用此分类决定
+ *  止损后是否保留 grok 会话上下文。 */
+export function isTransientRetryReason(reason: string): boolean {
+  return /50[234]|upstream|temporar|unavail|rate.?limit|timeout|timed?\s*out|econn|reset|hang\s*up|network|connection|overload|busy|too\s*many/i.test(reason);
+}
 
 export class AcpDriver {
   private pool = new Map<string, Conn>();
@@ -460,14 +474,24 @@ export class AcpDriver {
     if (!info.retryStartedAt) info.retryStartedAt = Date.now();
     info.retry = retry;
     this.handlers.onRetryState(sid, retry);
-    // 双保险止损：同类重试到 N 次（默认 5，约 60-70s）或持续超时（默认 120s）即 cancel。
-    // 实测教训：中转返回空响应/鉴权失败时 grok 会无限指数退避，prompt 永不 resolve。
-    const attemptLimit = this.opts.retryAbortAttempts ?? DEFAULT_ABORT_ATTEMPTS;
-    const elapsedAbort = Date.now() - info.retryStartedAt > (this.opts.retryAbortMs ?? DEFAULT_ABORT_MS);
+    // 双保险止损，按错误可恢复性分类给预算（2026-10-08 老人反馈"重试 1 次太少"放宽）：
+    // - 瞬态类（上游 5xx/超时/限流/网络抖动）：等待往往自愈——8 次 / 5 分钟才止损，
+    //   期间 grok 的回合内退避重试成功则任务无感继续。
+    // - 硬错误类（鉴权/协议/参数）：重试无意义——维持紧止损 5 次 / 120s 快速失败。
+    // 实测教训（紧止损的由来）：中转返回空响应/鉴权失败时 grok 会无限指数退避，
+    // prompt 永不 resolve——所以硬错误类绝不能放开。
+    const transient = isTransientRetryReason(retry.reason);
+    const attemptLimit = transient
+      ? (this.opts.retryTransientAttempts ?? DEFAULT_TRANSIENT_ATTEMPTS)
+      : (this.opts.retryAbortAttempts ?? DEFAULT_ABORT_ATTEMPTS);
+    const elapsedLimit = transient
+      ? (this.opts.retryTransientMs ?? DEFAULT_TRANSIENT_MS)
+      : (this.opts.retryAbortMs ?? DEFAULT_ABORT_MS);
+    const elapsedAbort = Date.now() - info.retryStartedAt > elapsedLimit;
     if (retry.attempt >= attemptLimit || elapsedAbort) {
       if (!info.aborted) {
         info.aborted = true;
-        this.log(`acp retry ABORT (attempt=${retry.attempt} reason=${retry.reason})`, { sid: sid.slice(0, 8) });
+        this.log(`acp retry ABORT (attempt=${retry.attempt} reason=${retry.reason} transient=${transient})`, { sid: sid.slice(0, 8) });
         this.cancel(sid).catch(() => {});
       }
     }
