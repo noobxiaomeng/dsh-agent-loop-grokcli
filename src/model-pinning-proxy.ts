@@ -129,6 +129,32 @@ export function usageSince(sinceMs: number): { inputTokens: number; outputTokens
   };
 }
 
+/** 递归补全嵌套 error 对象缺失的 code/message（2026-10-08 变体：上游故障时中转把
+ *  502 包成 response.failed 类事件，response.error 只有 message/type 没有 code，grok
+ *  的 serde 反序列化照炸 missing field `code`。顶层 type:"error" 事件的补全管不到
+ *  嵌套层，这里对任意层级的 "error" 键对象做同样补全）。返回是否发生改写。 */
+function completeNestedErrors(v: unknown): boolean {
+  let changed = false;
+  const walk = (o: Record<string, unknown>): void => {
+    for (const [k, val] of Object.entries(o)) {
+      if (k === "error" && val !== null && typeof val === "object" && !Array.isArray(val)) {
+        const e = val as Record<string, unknown>;
+        if (e.code === undefined) { e.code = "relay_error"; changed = true; }
+        if (e.message === undefined) { e.message = "relay error without message"; changed = true; }
+        walk(e); // error 对象内部再嵌套也补
+      } else if (Array.isArray(val)) {
+        for (const item of val) {
+          if (item !== null && typeof item === "object" && !Array.isArray(item)) walk(item as Record<string, unknown>);
+        }
+      } else if (val !== null && typeof val === "object") {
+        walk(val as Record<string, unknown>);
+      }
+    }
+  };
+  if (v !== null && typeof v === "object" && !Array.isArray(v)) walk(v as Record<string, unknown>);
+  return changed;
+}
+
 function handle(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse, getTarget: () => PinTarget | null): void {
   const chunks: Buffer[] = [];
   req.on("data", (c: Buffer) => chunks.push(c));
@@ -239,12 +265,22 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
         const sanitizeBlock = (text: string): string => {
           if (!text.includes("error")) return text;
           try {
-            const j = JSON.parse(text) as { error?: { code?: unknown; message?: unknown } & Record<string, unknown> };
-            if (j && typeof j === "object" && j.error && typeof j.error === "object" && j.error.code === undefined) {
-              j.error.code = "relay_error";
-              if (j.error.message === undefined) j.error.message = "relay error without code";
-              console.log(`[grokcli] pin: 补全非流式 error.code (${text.length}B)`);
-              return JSON.stringify(j);
+            const j = JSON.parse(text) as unknown;
+            if (j && typeof j === "object") {
+              // 嵌套 error 对象（含顶层 {"error":{...}} 形态）递归补全——grok serde 要求
+              // error.code 必在，中转上游故障时的非流式错误体常常只有 message/type。
+              if (completeNestedErrors(j)) {
+                console.log(`[grokcli] pin: 补全非流式嵌套 error 字段 (${text.length}B)`);
+                return JSON.stringify(j);
+              }
+              // 顶层 type:"error" 事件的 code/message 在事件根上（不在 error 键下），单独补
+              const o = j as { type?: unknown; code?: unknown; message?: unknown };
+              if (o.type === "error" && (o.code === undefined || o.message === undefined)) {
+                o.code = o.code ?? "relay_error";
+                o.message = o.message ?? "relay error without code";
+                console.log(`[grokcli] pin: 补全非流式 error 事件字段 (${text.length}B)`);
+                return JSON.stringify(j);
+              }
             }
           } catch { /* 非 JSON 原样 */ }
           return text;
@@ -295,6 +331,12 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                 (ev as Record<string, unknown>).message = ev.message ?? "relay returned a malformed error event";
                 forward = "data: " + JSON.stringify(ev) + "\n";
                 console.log(`[grokcli] pin: 补全 error 事件字段 (code=${String(ev.code)})`);
+              }
+              // 嵌套变体（2026-10-08）：response.failed 类事件里 response.error 缺 code——
+              // 顶层补全管不到，递归补全后整行重写
+              if (completeNestedErrors(ev)) {
+                forward = "data: " + JSON.stringify(ev) + "\n";
+                console.log(`[grokcli] pin: 补全嵌套 error 字段 (responses SSE ${payload.length}B)`);
               }
               if (ev.response?.usage) recordUsage(ev.response.usage);
               if (extra.length > 0) out.push(...extra);
