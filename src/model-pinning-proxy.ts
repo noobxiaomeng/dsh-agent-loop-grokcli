@@ -129,11 +129,15 @@ export function usageSince(sinceMs: number): { inputTokens: number; outputTokens
   };
 }
 
-/** 递归补全嵌套 error 对象缺失的 code/message（2026-10-08 变体：上游故障时中转把
- *  502 包成 response.failed 类事件，response.error 只有 message/type 没有 code，grok
- *  的 serde 反序列化照炸 missing field `code`。顶层 type:"error" 事件的补全管不到
- *  嵌套层，这里对任意层级的 "error" 键对象做同样补全）。返回是否发生改写。 */
-function completeNestedErrors(v: unknown): boolean {
+/** 递归补全中转残缺事件的必需形状（2026-10-08 两变体）：
+ *  ① error 对象缺 code/message——上游故障时中转把 502 包成 response.failed 类事件，
+ *    response.error 只有 message/type，grok serde 炸 missing field `code`。
+ *  ② response 对象缺 output 数组——中转合成 response.completed/failed 类事件时漏带，
+ *    grok serde 炸 missing field `output`（补空数组=模型空响应，交给 grok 正常处理
+ *    而不是炸流）。
+ *  顶层 type:"error" 事件的 code/message 在事件根上（不在 error 键下），由调用方单独补。
+ *  返回是否发生改写。 */
+function completeRelayEventShape(v: unknown): boolean {
   let changed = false;
   const walk = (o: Record<string, unknown>): void => {
     for (const [k, val] of Object.entries(o)) {
@@ -142,6 +146,10 @@ function completeNestedErrors(v: unknown): boolean {
         if (e.code === undefined) { e.code = "relay_error"; changed = true; }
         if (e.message === undefined) { e.message = "relay error without message"; changed = true; }
         walk(e); // error 对象内部再嵌套也补
+      } else if (k === "response" && val !== null && typeof val === "object" && !Array.isArray(val)) {
+        const r = val as Record<string, unknown>;
+        if (!Array.isArray(r.output)) { r.output = []; changed = true; }
+        walk(r); // response 内部还可能带 error/嵌套
       } else if (Array.isArray(val)) {
         for (const item of val) {
           if (item !== null && typeof item === "object" && !Array.isArray(item)) walk(item as Record<string, unknown>);
@@ -263,13 +271,13 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
           } catch { /* dump 失败无妨 */ }
         };
         const sanitizeBlock = (text: string): string => {
-          if (!text.includes("error")) return text;
+          if (!text.includes("error") && !text.includes('"response"')) return text;
           try {
             const j = JSON.parse(text) as unknown;
             if (j && typeof j === "object") {
-              // 嵌套 error 对象（含顶层 {"error":{...}} 形态）递归补全——grok serde 要求
-              // error.code 必在，中转上游故障时的非流式错误体常常只有 message/type。
-              if (completeNestedErrors(j)) {
+              // 嵌套 error/response 对象递归补全——grok serde 要求 error.code 与
+              // response.output 必在，中转上游故障时的残缺体常常缺这些字段。
+              if (completeRelayEventShape(j)) {
                 console.log(`[grokcli] pin: 补全非流式嵌套 error 字段 (${text.length}B)`);
                 return JSON.stringify(j);
               }
@@ -334,7 +342,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
               }
               // 嵌套变体（2026-10-08）：response.failed 类事件里 response.error 缺 code——
               // 顶层补全管不到，递归补全后整行重写
-              if (completeNestedErrors(ev)) {
+              if (completeRelayEventShape(ev)) {
                 forward = "data: " + JSON.stringify(ev) + "\n";
                 console.log(`[grokcli] pin: 补全嵌套 error 字段 (responses SSE ${payload.length}B)`);
               }
