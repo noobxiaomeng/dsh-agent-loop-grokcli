@@ -36,18 +36,47 @@ export class ModelPinningProxy {
     pinState.target = target;
   }
 
+  /** 固定端口候选（2026-10-08 端口漂移根治）：随机端口在桌面重启后漂移，grok 进程
+   *  spawn 时读的 config.toml 里的旧端口在空窗期是死的——孤儿 grok / 时序错配都会打
+   *  死端口报 error sending request。固定端口让新桌面重新监听同一端口，旧配置继续
+   *  有效。候选依次尝试（被占/防火墙拦则顺延），全占回退随机端口。 */
   static start(): Promise<ModelPinningProxy> {
+    const envPort = Number(process.env.GROKDESK_PIN_PORT ?? 0);
+    const candidates = [
+      ...(Number.isInteger(envPort) && envPort > 0 ? [envPort] : []),
+      53909, 53910, 53911,
+    ];
     return new Promise((resolve, reject) => {
-      const server = createServer((req, res) => handle(req, res, () => pinState.target));
-      server.on("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const addr = server.address();
-        if (addr == null || typeof addr === "string") {
-          reject(new Error("pinning proxy failed to bind"));
-          return;
-        }
-        resolve(new ModelPinningProxy(addr.port, server));
-      });
+      const tryBind = (port: number | 0, fallback: number[]): void => {
+        const server = createServer((req, res) => handle(req, res, () => pinState.target));
+        const fail = (err: Error): void => {
+          server.removeAllListeners();
+          const next = fallback.shift();
+          if (next === undefined) {
+            if (port === 0) {
+              // 随机兜底也失败：直接放弃（绝不无限重试）
+              reject(new Error(`pinning proxy failed to bind: ${String(err)}`));
+              return;
+            }
+            // 全部固定候选失败：兜底随机端口（行为同旧版）
+            tryBind(0, []);
+            return;
+          }
+          tryBind(next, fallback);
+        };
+        server.on("error", fail);
+        server.listen(port, "127.0.0.1", () => {
+          const addr = server.address();
+          if (addr == null || typeof addr === "string") {
+            fail(new Error("pinning proxy failed to bind"));
+            return;
+          }
+          console.log(`[grokcli] pin proxy listening on 127.0.0.1:${addr.port}${port === 0 ? " (random fallback)" : ""}`);
+          resolve(new ModelPinningProxy(addr.port, server));
+        });
+      };
+      const first = candidates.shift();
+      tryBind(first ?? 0, candidates);
     });
   }
 

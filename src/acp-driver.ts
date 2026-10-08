@@ -120,7 +120,7 @@ const NOTIFICATION_ONLY_KINDS = new Set(["response_completed", "turn_completed",
  *  鉴权/协议/参数类硬错误重试无意义，维持紧止损。bridge 侧同用此分类决定
  *  止损后是否保留 grok 会话上下文。 */
 export function isTransientRetryReason(reason: string): boolean {
-  return /50[234]|upstream|temporar|unavail|rate.?limit|timeout|timed?\s*out|econn|reset|hang\s*up|network|connection|overload|busy|too\s*many/i.test(reason);
+  return /50[234]|upstream|temporar|unavail|rate.?limit|timeout|timed?\s*out|econn|reset|hang\s*up|network|connection|error sending request|send(ing)? request|fetch failed|overload|busy|too\s*many/i.test(reason);
 }
 
 export class AcpDriver {
@@ -469,7 +469,7 @@ export class AcpDriver {
     if (!info) return;
     const retry: AcpRetryState = {
       attempt: Number(u.attempt || u.retry || 1),
-      reason: String(u.reason || u.error || u.kind || "provider_retry").slice(0, 80),
+      reason: String(u.reason || u.error || u.kind || "provider_retry").slice(0, 200),
     };
     if (!info.retryStartedAt) info.retryStartedAt = Date.now();
     info.retry = retry;
