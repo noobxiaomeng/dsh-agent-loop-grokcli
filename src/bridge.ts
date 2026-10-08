@@ -997,7 +997,11 @@ export class GrokBridgeAgent implements Agent {
   /** 未闭合回合兜底（2026-10-06 嵌套 turn 事故）：被强杀/崩溃的回合没有 turn/end——
    *  resume 的冷读不校验嵌套，新回合直接 turn/start 会写出嵌套 turn（dsh relationships
    *  校验器随后判整个会话损坏）。开新回合前若投影里还有 open turn，先补 step/end +
-   *  turn/end（interrupted）闭合它。 */
+   *  turn/end（interrupted）闭合它。
+   *  2026-10-08 修复（实锄件 session-f9e42ad5）：段化 step 后一个回合可有任意多个
+   *  step，且 step 可能全部已闭（仅 turn 悬空）——旧版硬编码补 step/end{step:1} 在
+   *  「无开启 step」时落野事件，直接毒化日志（step/end does not match an open turn
+   *  and step）。改为回放事件流算出真实开启 step：有则按实际号闭合，无则只闭 turn。 */
   private closeOpenTurnIfAny(): void {
     try {
       const projections = (this.loopCtx as unknown as { sessionProjections?: { stateOf(s: Session, key: string): { openTurnStartSeq?: number | null; lastTurn?: number } | undefined } }).sessionProjections;
@@ -1006,8 +1010,24 @@ export class GrokBridgeAgent implements Agent {
       const turn = st.lastTurn ?? 0;
       if (turn <= 0) return;
       console.log(`[grokcli] open turn ${turn} detected (被强杀/崩溃的回合) -> 补闭合`);
+      // 回放会话事件算当前开启的 step 号（懒开懒关后可能是 1..N 中的任何一个，或无）
+      let openStep: number | null = null;
+      try {
+        const events = (this.session as unknown as { snapshotEvents(from: number): readonly { type: string; data?: { step?: number } }[] }).snapshotEvents(0);
+        for (const ev of events) {
+          if (ev.type === "turn/start" || ev.type === "turn/end") openStep = null;
+          else if (ev.type === "step/start") openStep = ev.data?.step ?? null;
+          else if (ev.type === "step/end") openStep = null;
+        }
+      } catch (e) {
+        console.log(`[grokcli] open-step scan failed (${String(e).slice(0, 80)}) -> 只闭 turn`);
+        openStep = null;
+      }
       // step/end、turn/end 不是 surface 事件：append 不能带 surfaceOp（校验器拒，实锄件）
-      this.session.append("step/end", { turn, step: 1 });
+      if (openStep !== null) {
+        this.session.append("step/end", { turn, step: openStep });
+        console.log(`[grokcli] 补闭合 step/end turn=${turn} step=${openStep}`);
+      }
       this.session.append("turn/end", { turn, reason: { kind: "interrupted" } } as never);
     } catch { /* 投影不可用时跳过兜底 */ }
   }
