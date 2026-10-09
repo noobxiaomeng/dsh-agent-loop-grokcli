@@ -120,7 +120,7 @@ const NOTIFICATION_ONLY_KINDS = new Set(["response_completed", "turn_completed",
  *  鉴权/协议/参数类硬错误重试无意义，维持紧止损。bridge 侧同用此分类决定
  *  止损后是否保留 grok 会话上下文。 */
 export function isTransientRetryReason(reason: string): boolean {
-  return /50[234]|upstream|temporar|unavail|rate.?limit|timeout|timed?\s*out|econn|reset|hang\s*up|network|connection|error sending request|send(ing)? request|fetch failed|overload|busy|too\s*many/i.test(reason);
+  return /50[0-4]|upstream|temporar|unavail|rate.?limit|timeout|timed?\s*out|econn|reset|hang\s*up|network|connection|error sending request|send(ing)? request|fetch failed|overload|busy|too\s*many/i.test(reason);
 }
 
 export class AcpDriver {
@@ -250,6 +250,14 @@ export class AcpDriver {
             // 不回 result = 工具永久挂起（计划模式/提问卡死事故根因，抓线实证）。
             this.handleServerRequest(conn, msg.id, msg.method, msg.params || {});
           } else if (msg.method === "session/update") {
+            const suSid = msg.params?.sessionId;
+            if (typeof suSid === "string") {
+              const si2 = this.sessionInfo.get(suSid);
+              // 重试故障期结束（正常内容流量恢复）→ 时钟复位：长回合里第二次瞬态故障
+              // 重新享有完整预算（否则 elapsed 从上一期起算，秒判超时止损——实锄件
+              // 「已重试 1 次仍无恢复」即此误伤）。
+              if (si2?.retry) { si2.retry = null; si2.retryStartedAt = 0; }
+            }
             this.handlers.onUpdate(msg.params?.sessionId, (msg.params || {}).update || {});
           } else if (msg.method === "_x.ai/session_notification") {
             const u = (msg.params && msg.params.update) || {};
